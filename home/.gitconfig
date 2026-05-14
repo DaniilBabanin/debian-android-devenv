@@ -1,0 +1,19 @@
+[user]
+	# fill these in — kept here so they persist across reinstalls
+	# name = Your Name
+	# email = you@example.com
+[init]
+	defaultBranch = main
+[pull]
+	rebase = false
+[core]
+	editor = nvim
+	pager = less -FRX
+[color]
+	ui = auto
+[alias]
+	st = status
+	co = checkout
+	br = branch
+	lg = log --oneline --graph --decorate -20
+	lga = log --oneline --graph --decorate --all -30

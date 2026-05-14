@@ -1,0 +1,29 @@
+# Runtime-generated state — never commit. devenv writes these on the live
+# install; if you clone this repo into your working /mnt/shared/debian-env,
+# these patterns keep your credentials, history, and ssh keys out of git.
+
+# Snapshot tree (contains a full copy of ~/.claude, .bash_history, etc.)
+state/
+
+# Archives: ~/.ssh, ~/.gnupg, anything else baked as tar.gz
+archives/
+
+# Module install sentinels
+*.installed
+
+# Stateful dotfile dirs and files when present at the repo root
+home/.claude/
+home/.bash_history
+home/.config/pulse/
+
+# Backup dir created by `devenv init` when it relocates pre-existing dotfiles
+.devenv-backup/
+
+# Local-only notes
+tool-wishlist.local.md
+
+# Editor / OS noise
+.DS_Store
+*.swp
+*.swo
+*~

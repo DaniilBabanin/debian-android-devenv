@@ -1,0 +1,474 @@
+#!/usr/bin/env bash
+# devenv — dispatcher for the persistent dev environment.
+# Usage:
+#   devenv init                          re-run init (link dotfiles, etc.)
+#   devenv install [mod...]              install named modules; `all` = every module
+#   devenv list                          list available modules and installed state
+#   devenv doctor                        verify symlinks + tool availability
+#   devenv sync                          report drift if home/ is a git repo
+#   devenv snapshot                      copy STATEFUL_DIRS from $HOME into $DEVENV_ROOT/state
+#   devenv restore                       copy STATEFUL_DIRS from $DEVENV_ROOT/state into $HOME
+#   devenv help                          show this
+
+set -euo pipefail
+# Resolve through symlinks so this works when invoked via ~/.local/bin/devenv.
+__self="${BASH_SOURCE[0]}"
+while [ -L "$__self" ]; do __self="$(readlink -f "$__self")"; done
+# shellcheck disable=SC1091
+source "$(dirname "$__self")/lib.sh"
+
+cmd="${1:-help}"; shift || true
+
+cmd_help() {
+    cat <<EOF
+devenv — persistent dev environment for Debian-on-Android
+root: $DEVENV_ROOT
+
+Commands:
+  init                           link dotfiles into \$HOME (idempotent)
+  install <mod>...               install one or more modules
+                                 use 'all' to install every module
+  list                           show modules and which are marked installed
+  doctor                         verify symlinks and tool availability
+  sync                           if home/ is a git repo, show pending changes
+  snapshot                       copy STATEFUL_DIRS into \$DEVENV_ROOT/state
+                                 and tar ARCHIVE_DIRS into \$DEVENV_ROOT/archives
+  restore                        reverse of snapshot — rsync stateful dirs
+                                 and extract archive tarballs into \$HOME
+  help                           this message
+
+Modules ship in: $DEVENV_MODULES
+Snapshots in:    $DEVENV_SNAPSHOT_DIR
+Archives in:     $DEVENV_ARCHIVES
+EOF
+}
+
+cmd_init() {
+    bash "$DEVENV_BIN/init.sh"
+}
+
+cmd_list() {
+    local mods; mods="$(list_modules)"
+    if [ -z "$mods" ]; then warn "no modules in $DEVENV_MODULES"; return; fi
+    printf '%-12s  %-10s  %s\n' MODULE STATE SENTINEL
+    printf '%-12s  %-10s  %s\n' ------ ----- --------
+    local m s
+    while IFS= read -r m; do
+        if sentinel_check "$m"; then
+            s="installed"
+        else
+            s="-"
+        fi
+        printf '%-12s  %-10s  %s\n' "$m" "$s" "$(sentinel_path "$m")"
+    done <<<"$mods"
+}
+
+cmd_install() {
+    [ $# -gt 0 ] || die "install: need at least one module (or 'all')"
+    local mods=()
+    if [ "$1" = "all" ]; then
+        # Default order — modules with deps must come after their deps.
+        local preferred=(base node python claude)
+        local available; available="$(list_modules)"
+        local m
+        for m in "${preferred[@]}"; do
+            if grep -qx "$m" <<<"$available"; then mods+=("$m"); fi
+        done
+        # Append any extras not in the preferred list, in alpha order.
+        while IFS= read -r m; do
+            local found=0
+            local p; for p in "${preferred[@]}"; do [ "$p" = "$m" ] && { found=1; break; }; done
+            [ $found -eq 0 ] && mods+=("$m")
+        done <<<"$available"
+    else
+        mods=("$@")
+    fi
+
+    log "installing: ${mods[*]}"
+    local m; for m in "${mods[@]}"; do run_module "$m"; done
+    ok "all done."
+}
+
+# True if $1 is one of the names in STATEFUL_DIRS.
+_in_stateful() {
+    local needle="$1" d
+    for d in "${STATEFUL_DIRS[@]}"; do [ "$d" = "$needle" ] && return 0; done
+    return 1
+}
+
+cmd_doctor() {
+    # Avoid iterating literal glob patterns when a match set is empty, and
+    # include dotfiles in `*` so we don't need parallel `.foo` patterns.
+    shopt -s nullglob dotglob
+
+    local fails=0
+
+    step "symlinks"
+    local entry rel src dst
+    for entry in "$DEVENV_HOME"/*; do
+        [ -e "$entry" ] || continue
+        rel="$(basename "$entry")"
+        # STATEFUL_DIRS are managed by snapshot/restore, not symlinked.
+        if _in_stateful "$rel"; then continue; fi
+        src="$DEVENV_HOME/$rel"
+        dst="$HOME/$rel"
+        if [ -L "$dst" ] && [ "$(readlink "$dst")" = "$src" ]; then
+            ok "~/$rel"
+        else
+            warn "~/$rel not linked (run: devenv init)"
+            fails=$((fails+1))
+        fi
+    done
+
+    step "stateful dirs"
+    local name
+    for name in "${STATEFUL_DIRS[@]}"; do
+        if [ -L "$HOME/$name" ]; then
+            warn "~/$name is a symlink — should be a real path (run: devenv init && devenv restore)"
+            fails=$((fails+1))
+        elif [ -e "$HOME/$name" ]; then
+            ok "~/$name present (snapshot-managed)"
+        else
+            warn "~/$name missing — run: devenv restore"
+        fi
+    done
+
+    step "dispatcher on PATH"
+    if have devenv; then ok "devenv: $(command -v devenv)"; else warn "devenv not on PATH"; fails=$((fails+1)); fi
+
+    step "modules"
+    local m t
+    while IFS= read -r m; do
+        case "$m" in
+            base)   for t in gcc git curl jq tmux nvim fzf rg; do
+                        if have "$t"; then ok "base: $t"; else warn "base: missing $t"; fails=$((fails+1)); fi
+                    done ;;
+            node)   if have nvm || [ -s "$HOME/.nvm/nvm.sh" ]; then ok "node: nvm present"; else warn "node: nvm missing"; fails=$((fails+1)); fi
+                    if have node; then ok "node: $(node --version)"; else warn "node: node missing"; fails=$((fails+1)); fi ;;
+            python) for t in python3 pipx uv; do
+                        if have "$t"; then ok "python: $t"; else warn "python: missing $t"; fails=$((fails+1)); fi
+                    done ;;
+            claude) if have claude; then ok "claude: $(claude --version 2>&1 | head -1)"; else warn "claude: missing (run devenv install claude)"; fails=$((fails+1)); fi ;;
+        esac
+    done < <(list_modules)
+
+    step "fs perms sanity"
+    if [ -L "$HOME/.bashrc" ]; then
+        local mode; mode="$(stat -c '%a' "$HOME/.bashrc" 2>/dev/null || echo ?)"
+        if [ "$mode" = "?" ]; then warn "cannot stat ~/.bashrc"; else ok ".bashrc mode=$mode"; fi
+    fi
+    if [ -d "$DEVENV_ROOT" ]; then
+        local fstype; fstype="$(stat -f -c '%T' "$DEVENV_ROOT" 2>/dev/null || echo ?)"
+        log "devenv root filesystem: $fstype  (FUSE/sdcardfs often ignores chmod — flagged for ssh/gpg)"
+    fi
+
+    step "snapshot status"
+    if [ -f "$DEVENV_SNAPSHOT_DIR/snapshot.ts" ]; then
+        ok "snapshot: $(cat "$DEVENV_SNAPSHOT_DIR/snapshot.ts")"
+    else
+        warn "no snapshot yet (run: devenv snapshot)"
+    fi
+
+    step "archives"
+    local a path mtime
+    for a in "${ARCHIVE_DIRS[@]}"; do
+        path="$(_archive_path "$a")"
+        if [ -f "$path" ]; then
+            mtime="$(stat -c '%y' "$path" 2>/dev/null | cut -d. -f1)"
+            ok "archive: ~/$a -> ${path##*/} (${mtime:-?})"
+        else
+            warn "archive: no ${path##*/} yet (run: devenv snapshot)"
+        fi
+    done
+
+    echo
+    if [ $fails -eq 0 ]; then ok "doctor: all clear"; else warn "doctor: $fails issue(s)"; return 1; fi
+}
+
+cmd_sync() {
+    if [ -d "$DEVENV_ROOT/.git" ]; then
+        ( cd "$DEVENV_ROOT" && git status --short )
+        log "tip: cd $DEVENV_ROOT && git add -A && git commit -m 'sync'"
+    else
+        log "home/ is symlinked live — no sync needed. (init a git repo at $DEVENV_ROOT to track history.)"
+    fi
+}
+
+# ---------------------------------------------------------------------------
+# snapshot / restore
+# ---------------------------------------------------------------------------
+
+# Pick a copy strategy. rsync preferred for --delete and exclude support;
+# cp -a is a degraded fallback that can't prune deleted files.
+_copy_engine() {
+    if have rsync; then printf rsync; else printf cp; fi
+}
+
+# Copy a single entry from $HOME into the snapshot tree.
+_snapshot_entry() {
+    local name="$1"
+    local src="$HOME/$name"
+    local dst="$DEVENV_SNAPSHOT_DIR/home/$name"
+    local engine; engine="$(_copy_engine)"
+
+    if [ -L "$src" ]; then
+        warn "snapshot: ~/$name is a symlink; skipping (run \`devenv init\` to detach legacy symlinks)"
+        return 0
+    fi
+    if [ ! -e "$src" ]; then
+        warn "snapshot: ~/$name does not exist; skipping"
+        return 0
+    fi
+
+    if [ -d "$src" ]; then
+        mkdir -p "$dst"
+        if [ "$engine" = "rsync" ]; then
+            # *.wants/ — systemd enable-state symlink dirs (default.target.wants/, etc.)
+            # are recreated by `systemctl --user enable` in init.sh, and virtio-fs
+            # on Android shared storage can't create symlinks anyway.
+            rsync -a --delete --info=stats1 \
+                --exclude='*.db-wal' --exclude='*.db-shm' --exclude='*.lock' \
+                --exclude='*.wants/' \
+                "$src/" "$dst/"
+        else
+            # cp -a fallback: cannot prune deletions. Refresh existing files.
+            cp -a -- "$src/." "$dst/"
+        fi
+        ok "snapshot: ~/$name/"
+    else
+        # Regular file (e.g. .bash_history).
+        mkdir -p "$(dirname "$dst")"
+        if [ "$engine" = "rsync" ]; then
+            rsync -a --info=stats1 -- "$src" "$dst"
+        else
+            cp -a -- "$src" "$dst"
+        fi
+        ok "snapshot: ~/$name"
+    fi
+}
+
+_archive_path() {
+    # archives/<name-without-leading-dot>.tar.gz so the directory listing reads
+    # ssh.tar.gz / gnupg.tar.gz instead of .ssh.tar.gz / .gnupg.tar.gz.
+    printf '%s/%s.tar.gz\n' "$DEVENV_ARCHIVES" "${1#.}"
+}
+
+# Snapshot ~/<name> into a tar.gz at archives/<name>.tar.gz. Perms are
+# preserved in the tar metadata regardless of what the destination filesystem
+# (FUSE/sdcardfs) does to mode bits on the bare files.
+_snapshot_archive() {
+    local name="$1"
+    local src="$HOME/$name"
+    local out; out="$(_archive_path "$name")"
+
+    if [ -L "$src" ]; then
+        warn "archive: ~/$name is a symlink; skipping"
+        return 0
+    fi
+    if [ ! -e "$src" ]; then
+        log "archive: ~/$name does not exist; skipping"
+        return 0
+    fi
+
+    mkdir -p "$(dirname "$out")"
+    local tmp="${out}.tmp.$$"
+    # Run from $HOME so the archive contains ".ssh/..." not "/home/user/.ssh/...".
+    if ( cd "$HOME" && tar -czf "$tmp" -- "$name" ); then
+        mv -- "$tmp" "$out"
+        ok "archive: ~/$name -> $out ($(stat -c %s "$out" 2>/dev/null || echo ?) bytes)"
+    else
+        rm -f -- "$tmp"
+        err "archive: failed to write $out"
+        return 1
+    fi
+}
+
+# Enforce strict perms after extraction. tar metadata should already carry the
+# right modes, but a belt-and-suspenders chmod here means a tarball edited by
+# something perm-blind on the shared mount can't silently break SSH.
+_archive_perms_fix() {
+    local name="$1"
+    local dst="$HOME/$name"
+    [ -d "$dst" ] || return 0
+    case "$name" in
+        .ssh)
+            chmod 700 "$dst" || true
+            local f
+            while IFS= read -r f; do
+                case "$(basename "$f")" in
+                    *.pub) chmod 644 "$f" || true ;;
+                    *)     chmod 600 "$f" || true ;;
+                esac
+            done < <(find "$dst" -maxdepth 1 -type f)
+            ;;
+        .gnupg)
+            chmod 700 "$dst" || true
+            find "$dst" -type d -exec chmod 700 {} + 2>/dev/null || true
+            find "$dst" -type f -exec chmod 600 {} + 2>/dev/null || true
+            ;;
+    esac
+}
+
+_restore_archive() {
+    local name="$1"
+    local in; in="$(_archive_path "$name")"
+
+    if [ ! -f "$in" ]; then
+        return 1
+    fi
+
+    # Drop a leftover legacy symlink (~/.ssh -> /mnt/shared/...) before extract.
+    if [ -L "$HOME/$name" ]; then
+        warn "restore: ~/$name was a symlink ($(readlink "$HOME/$name")); removing before extract"
+        rm -- "$HOME/$name"
+    fi
+
+    # tar -x overwrites files in the archive without deleting extras already on
+    # disk — same merge semantics as the rsync-based STATEFUL_DIRS restore.
+    if ( cd "$HOME" && tar -xzf "$in" ); then
+        ok "restored ~/$name from $in"
+        _archive_perms_fix "$name"
+        return 0
+    else
+        err "restore: extract failed for $in"
+        return 1
+    fi
+}
+
+cmd_snapshot() {
+    step "snapshot -> $DEVENV_SNAPSHOT_DIR"
+
+    local engine; engine="$(_copy_engine)"
+    if [ "$engine" = "cp" ]; then
+        warn "rsync not available; falling back to cp -a (no pruning of deletions)"
+    fi
+
+    mkdir -p "$DEVENV_SNAPSHOT_DIR/home"
+
+    local name
+    for name in "${STATEFUL_DIRS[@]}"; do
+        _snapshot_entry "$name"
+    done
+
+    mkdir -p "$DEVENV_ARCHIVES"
+    for name in "${ARCHIVE_DIRS[@]}"; do
+        _snapshot_archive "$name"
+    done
+
+    if have dpkg; then
+        dpkg --get-selections >"$DEVENV_SNAPSHOT_DIR/dpkg-selections.txt"
+        ok "wrote dpkg-selections.txt ($(wc -l <"$DEVENV_SNAPSHOT_DIR/dpkg-selections.txt") lines)"
+    else
+        warn "dpkg not available; skipping dpkg-selections.txt"
+    fi
+
+    if have apt-mark; then
+        apt-mark showmanual >"$DEVENV_SNAPSHOT_DIR/apt-manual.txt"
+        ok "wrote apt-manual.txt ($(wc -l <"$DEVENV_SNAPSHOT_DIR/apt-manual.txt") lines)"
+    else
+        warn "apt-mark not available; skipping apt-manual.txt"
+    fi
+
+    date -Iseconds >"$DEVENV_SNAPSHOT_DIR/snapshot.ts"
+    ok "snapshot complete: $(cat "$DEVENV_SNAPSHOT_DIR/snapshot.ts")"
+}
+
+# Copy a single entry from the snapshot tree back into $HOME.
+# No --delete: never wipe VM-side files that happen to be newer.
+_restore_entry() {
+    local name="$1"
+    local src="$DEVENV_SNAPSHOT_DIR/home/$name"
+    local dst="$HOME/$name"
+    local engine; engine="$(_copy_engine)"
+
+    if [ ! -e "$src" ]; then
+        return 1
+    fi
+
+    # If the destination is a leftover legacy symlink, drop it so we write a
+    # real file/dir at $HOME — not into /mnt/shared.
+    if [ -L "$dst" ]; then
+        warn "restore: ~/$name was a symlink ($(readlink "$dst")); removing before restore"
+        rm -- "$dst"
+    fi
+
+    if [ -d "$src" ]; then
+        mkdir -p "$dst"
+        if [ "$engine" = "rsync" ]; then
+            rsync -a --info=stats1 -- "$src/" "$dst/"
+        else
+            cp -a -- "$src/." "$dst/"
+        fi
+        ok "restored ~/$name/"
+    else
+        mkdir -p "$(dirname "$dst")"
+        if [ "$engine" = "rsync" ]; then
+            rsync -a --info=stats1 -- "$src" "$dst"
+        else
+            cp -a -- "$src" "$dst"
+        fi
+        ok "restored ~/$name"
+    fi
+    return 0
+}
+
+cmd_restore() {
+    step "restore <- $DEVENV_SNAPSHOT_DIR (+ archives)"
+
+    local engine; engine="$(_copy_engine)"
+    if [ "$engine" = "cp" ]; then
+        warn "rsync not available; falling back to cp -a"
+    fi
+
+    if [ -f "$DEVENV_SNAPSHOT_DIR/snapshot.ts" ]; then
+        log "snapshot taken: $(cat "$DEVENV_SNAPSHOT_DIR/snapshot.ts")"
+    else
+        warn "no snapshot.ts found — restoring whatever is present"
+    fi
+
+    local restored=() skipped=()
+    local name
+
+    # STATEFUL_DIRS — rsync from $DEVENV_SNAPSHOT_DIR/home/<name>.
+    if [ -d "$DEVENV_SNAPSHOT_DIR/home" ]; then
+        for name in "${STATEFUL_DIRS[@]}"; do
+            if _restore_entry "$name"; then
+                restored+=("$name")
+            else
+                skipped+=("$name")
+            fi
+        done
+    else
+        for name in "${STATEFUL_DIRS[@]}"; do skipped+=("$name"); done
+    fi
+
+    # ARCHIVE_DIRS — extract from $DEVENV_ARCHIVES/<name>.tar.gz.
+    for name in "${ARCHIVE_DIRS[@]}"; do
+        if _restore_archive "$name"; then
+            restored+=("$name")
+        else
+            skipped+=("$name")
+        fi
+    done
+
+    if [ ${#restored[@]} -gt 0 ]; then
+        ok "restored: ${restored[*]}"
+    else
+        log "no entries restored"
+    fi
+    if [ ${#skipped[@]} -gt 0 ]; then
+        log "no snapshot/archive data for: ${skipped[*]}"
+    fi
+}
+
+case "$cmd" in
+    help|-h|--help) cmd_help ;;
+    init)           cmd_init "$@" ;;
+    install)        cmd_install "$@" ;;
+    list)           cmd_list ;;
+    doctor)         cmd_doctor ;;
+    sync)           cmd_sync ;;
+    snapshot)       cmd_snapshot ;;
+    restore)        cmd_restore ;;
+    *) err "unknown command: $cmd"; cmd_help; exit 2 ;;
+esac
