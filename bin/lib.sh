@@ -37,6 +37,7 @@ LINK_DOTFILES=(
 # .bash_history is a file rather than a directory; snapshot/restore handle both.
 STATEFUL_DIRS=(
     .claude
+    .claude.json
     .config
     .bash_history
 )

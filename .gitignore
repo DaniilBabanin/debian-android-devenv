@@ -13,6 +13,7 @@ archives/
 
 # Stateful dotfile dirs and files when present at the repo root
 home/.claude/
+home/.claude.json
 home/.bash_history
 home/.config/pulse/
 
