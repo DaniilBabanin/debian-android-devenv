@@ -17,6 +17,10 @@ PKGS=(
     fzf
     ripgrep
     bat
+    fd-find
+    universal-ctags
+    tokei
+    gh
     htop
     less
     man-db
@@ -42,11 +46,16 @@ log "base: installing ${#missing[@]} package(s): ${missing[*]}"
 maybe_sudo apt-get update
 maybe_sudo apt-get install -y --no-install-recommends "${missing[@]}"
 
-# On Debian, ripgrep installs as `rg`, bat as `batcat`. Symlink bat for convenience.
+# On Debian, ripgrep installs as `rg`, bat as `batcat`, fd as `fdfind`. Symlink
+# the friendly names for convenience.
+mkdir -p "$HOME/.local/bin"
 if have batcat && ! have bat; then
-    mkdir -p "$HOME/.local/bin"
     ln -sf "$(command -v batcat)" "$HOME/.local/bin/bat"
     ok "linked bat -> batcat"
+fi
+if have fdfind && ! have fd; then
+    ln -sf "$(command -v fdfind)" "$HOME/.local/bin/fd"
+    ok "linked fd -> fdfind"
 fi
 
 ok "base: done"

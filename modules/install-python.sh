@@ -29,4 +29,13 @@ else
     ok "python: uv already installed via pipx"
 fi
 
-ok "python: $(python3 --version)  uv: $(uv --version 2>/dev/null || echo missing)"
+# ast-grep ships as a pip-installable wrapper that fetches the prebuilt binary;
+# pipx keeps it isolated from the system python.
+if ! pipx list 2>/dev/null | grep -q '^package ast-grep-cli '; then
+    log "python: pipx install ast-grep-cli"
+    pipx install ast-grep-cli
+else
+    ok "python: ast-grep-cli already installed via pipx"
+fi
+
+ok "python: $(python3 --version)  uv: $(uv --version 2>/dev/null || echo missing)  ast-grep: $(ast-grep --version 2>/dev/null || echo missing)"
