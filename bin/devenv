@@ -198,10 +198,11 @@ cmd_sync() {
 # snapshot / restore
 # ---------------------------------------------------------------------------
 
-# Pick a copy strategy. rsync preferred for --delete and exclude support;
-# cp -a is a degraded fallback that can't prune deleted files.
-_copy_engine() {
-    if have rsync; then printf rsync; else printf cp; fi
+# rsync is mandatory. The cp -a fallback that used to live here was unreliable
+# on virtio-fs (Android shared storage) and could crash the VM mid-copy. The
+# bootstrap installs rsync before any snapshot/restore runs.
+_ensure_rsync() {
+    have rsync || die "rsync is required for snapshot/restore — install with: sudo apt install rsync"
 }
 
 # Copy a single entry from $HOME into the snapshot tree.
@@ -209,7 +210,6 @@ _snapshot_entry() {
     local name="$1"
     local src="$HOME/$name"
     local dst="$DEVENV_SNAPSHOT_DIR/home/$name"
-    local engine; engine="$(_copy_engine)"
 
     if [ -L "$src" ]; then
         warn "snapshot: ~/$name is a symlink; skipping (run \`devenv init\` to detach legacy symlinks)"
@@ -222,29 +222,20 @@ _snapshot_entry() {
 
     if [ -d "$src" ]; then
         mkdir -p "$dst"
-        if [ "$engine" = "rsync" ]; then
-            # virtio-fs on Android shared storage can't create symlinks, so we
-            # skip them outright with --no-links. *.wants/ (systemd enable-state
-            # symlink dirs) is excluded as a whole because it would be empty
-            # after --no-links anyway; systemctl --user enable in init.sh
-            # recreates it on restore.
-            rsync -a --no-links --delete --info=stats1 \
-                --exclude='*.db-wal' --exclude='*.db-shm' --exclude='*.lock' \
-                --exclude='*.wants/' \
-                "$src/" "$dst/"
-        else
-            # cp -a fallback: cannot prune deletions. Refresh existing files.
-            cp -a -- "$src/." "$dst/"
-        fi
+        # virtio-fs on Android shared storage can't create symlinks, so we skip
+        # them outright with --no-links. *.wants/ (systemd enable-state symlink
+        # dirs) is excluded as a whole because it would be empty after
+        # --no-links anyway; systemctl --user enable in init.sh recreates it
+        # on restore.
+        rsync -a --no-links --delete --info=progress2 \
+            --exclude='*.db-wal' --exclude='*.db-shm' --exclude='*.lock' \
+            --exclude='*.wants/' \
+            "$src/" "$dst/"
         ok "snapshot: ~/$name/"
     else
         # Regular file (e.g. .bash_history).
         mkdir -p "$(dirname "$dst")"
-        if [ "$engine" = "rsync" ]; then
-            rsync -a --no-links --info=stats1 -- "$src" "$dst"
-        else
-            cp -a -- "$src" "$dst"
-        fi
+        rsync -a --no-links --info=progress2 -- "$src" "$dst"
         ok "snapshot: ~/$name"
     fi
 }
@@ -340,10 +331,7 @@ _restore_archive() {
 cmd_snapshot() {
     step "snapshot -> $DEVENV_SNAPSHOT_DIR"
 
-    local engine; engine="$(_copy_engine)"
-    if [ "$engine" = "cp" ]; then
-        warn "rsync not available; falling back to cp -a (no pruning of deletions)"
-    fi
+    _ensure_rsync
 
     mkdir -p "$DEVENV_SNAPSHOT_DIR/home"
 
@@ -381,7 +369,6 @@ _restore_entry() {
     local name="$1"
     local src="$DEVENV_SNAPSHOT_DIR/home/$name"
     local dst="$HOME/$name"
-    local engine; engine="$(_copy_engine)"
 
     if [ ! -e "$src" ]; then
         return 1
@@ -396,19 +383,11 @@ _restore_entry() {
 
     if [ -d "$src" ]; then
         mkdir -p "$dst"
-        if [ "$engine" = "rsync" ]; then
-            rsync -a --info=stats1 -- "$src/" "$dst/"
-        else
-            cp -a -- "$src/." "$dst/"
-        fi
+        rsync -a --info=progress2 -- "$src/" "$dst/"
         ok "restored ~/$name/"
     else
         mkdir -p "$(dirname "$dst")"
-        if [ "$engine" = "rsync" ]; then
-            rsync -a --info=stats1 -- "$src" "$dst"
-        else
-            cp -a -- "$src" "$dst"
-        fi
+        rsync -a --info=progress2 -- "$src" "$dst"
         ok "restored ~/$name"
     fi
     return 0
@@ -417,10 +396,7 @@ _restore_entry() {
 cmd_restore() {
     step "restore <- $DEVENV_SNAPSHOT_DIR (+ archives)"
 
-    local engine; engine="$(_copy_engine)"
-    if [ "$engine" = "cp" ]; then
-        warn "rsync not available; falling back to cp -a"
-    fi
+    _ensure_rsync
 
     if [ -f "$DEVENV_SNAPSHOT_DIR/snapshot.ts" ]; then
         log "snapshot taken: $(cat "$DEVENV_SNAPSHOT_DIR/snapshot.ts")"

@@ -70,6 +70,16 @@ if [ "$mode" = "init-only" ]; then
     exit 0
 fi
 
+# ---- ensure rsync before any copying -------------------------------------
+# devenv snapshot/restore copy through /mnt/shared (virtio-fs / sdcardfs).
+# `cp -a` on that mount can crash the VM, so rsync is mandatory — install it
+# before step 2 even though install-base would otherwise pull it in later.
+if ! have rsync; then
+    log "installing rsync (required for restore/snapshot on shared mount)"
+    maybe_sudo apt-get update
+    maybe_sudo apt-get install -y --no-install-recommends rsync
+fi
+
 # ---- step 2: restore -----------------------------------------------------
 
 # Restore if either an rsync snapshot or any tar archive exists. Archives
