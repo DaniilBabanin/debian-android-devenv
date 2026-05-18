@@ -76,6 +76,73 @@ What doesn't persist, because reinstalling is cheap and the modules re-establish
 - pipx envs (re-installed by `install-python`)
 - the Claude binary itself (re-installed by `install-claude`, though creds in `~/.claude/` persist)
 
+## Telling Claude about the installed tools
+
+If you use Claude Code in this environment, paste the block below into your
+user-level `~/.claude/CLAUDE.md`. It tells the agent what's on PATH so it
+reaches for the right tool instead of falling back to whatever it knows from
+training, and points it at this repo's wishlist file for things it wishes were
+installed.
+
+````markdown
+# Missing tools
+
+If you wish a CLI tool were installed while working on a task, append it to
+`/mnt/shared/debian-env/tool-wishlist.md` (one line:
+`- tool — what it does / task that needed it / YYYY-MM-DD`).
+The user reviews this list before updating the dev env.
+
+# Available CLI tools
+
+## Search & inspection
+- `rg` (ripgrep) — default for code search; faster than `grep -r`, respects `.gitignore`
+- `fd` — fast `find` replacement, `.gitignore`-aware (symlinked from `fdfind`); prefer over `find` for name-based lookups
+- `ast-grep` — structural AST-based code search; use for "find all callers of X with arg shape Y" patterns that regex handles poorly. Always invoke as `ast-grep`; the upstream `sg` alias collides with Debian's `/usr/bin/sg` (newgrp)
+- `ctags` (universal-ctags) — generate a `tags` symbol index (`ctags -R`) for fast jump-to-def via `rg '^Symbol\b' tags`
+- `tokei` — fast per-language LOC / file count for a quick repo overview
+- `jq` — JSON parsing/filtering (APIs, configs, `package.json`)
+- `yq` — YAML querying (wraps `jq`); targeted reads of GH Actions / k8s / compose / pre-commit configs without Read-ing whole files
+- `dasel` — multi-format (TOML/JSON/YAML/XML) querying; reach for `pyproject.toml`, `Cargo.toml`, `wrangler.toml`
+- `sqlite3` — query `.db`/`.sqlite` files directly instead of writing throwaway Python
+- `bat` — syntax-highlighted file display (symlinked from `batcat`)
+- `tree` — directory overview (`tree -L 2 -I node_modules`)
+- `fzf` — interactive fuzzy finder; useful in pipes
+- `file` — identify unknown file types before opening
+
+## Network & transfer
+- `curl` / `wget` — HTTP fetches and downloads
+- `gh` — GitHub CLI; PR/issue/run/release ops, repo queries via `gh api`
+- `rsync` — incremental/remote copy; better than `cp -r` for large or remote trees
+- `ssh` / `scp` / `ssh-keygen` — remote shells, keys, secure copy
+
+## Archives & crypto
+- `zip` / `unzip`, `tar`, `gzip` — archives
+- `gpg` — signature verification, signing, encryption
+
+## Build & binaries
+- `git`, `make`, `gcc`/`g++` (build-essential) — version control and native compilation
+
+## Lint, diff & secret scan (verify before declaring done)
+- `shellcheck` — lint shell scripts before executing; catches quoting/glob errors at author time, not runtime
+- `ruff` — fast Python linter/formatter; verify Python diffs are clean before claiming done
+- `gitleaks` — scan for committed secrets; run before staging files that may contain credentials (`gitleaks detect --no-banner`)
+- `difft` (difftastic) — structural/syntax-aware diff; collapses formatting-only churn when reviewing changes
+
+## Debugging & perf
+- `strace` — trace syscalls of hanging or opaque processes; evidence over speculation during debugging
+- `hyperfine` — command-line benchmarking with warmups and statistical output
+
+## Scripting languages
+- `python3`, `perl` — available for ad-hoc scripting / one-liners
+
+## Process & session
+- `tmux` — long-lived sessions, split panes (for Claude background work prefer `run_in_background`)
+- `expect` — drive interactive prompts non-interactively; avoids "please run this yourself" handoffs when a CLI insists on a TTY
+````
+
+The wishlist path assumes you cloned this repo to `/mnt/shared/debian-env`;
+update the path in the pasted block if you cloned somewhere else.
+
 ## Adding a module
 
 Drop `modules/install-<name>.sh` into `modules/`. The dispatcher picks it up automatically.

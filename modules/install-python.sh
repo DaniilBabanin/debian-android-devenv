@@ -38,4 +38,11 @@ else
     ok "python: ast-grep-cli already installed via pipx"
 fi
 
-ok "python: $(python3 --version)  uv: $(uv --version 2>/dev/null || echo missing)  ast-grep: $(ast-grep --version 2>/dev/null || echo missing)"
+if ! pipx list 2>/dev/null | grep -q '^package ruff '; then
+    log "python: pipx install ruff"
+    pipx install ruff
+else
+    ok "python: ruff already installed via pipx"
+fi
+
+ok "python: $(python3 --version)  uv: $(uv --version 2>/dev/null || echo missing)  ast-grep: $(ast-grep --version 2>/dev/null || echo missing)  ruff: $(ruff --version 2>/dev/null || echo missing)"

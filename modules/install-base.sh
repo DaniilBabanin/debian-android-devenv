@@ -29,6 +29,14 @@ PKGS=(
     rsync
     tmux
     openssh-client
+    shellcheck
+    yq
+    sqlite3
+    gitleaks
+    dasel
+    strace
+    hyperfine
+    expect
 )
 
 # Skip-fast if all already installed.
@@ -56,6 +64,33 @@ fi
 if have fdfind && ! have fd; then
     ln -sf "$(command -v fdfind)" "$HOME/.local/bin/fd"
     ok "linked fd -> fdfind"
+fi
+
+# difftastic: not packaged for Debian; fetch the prebuilt arm64/x86_64 binary.
+if ! have difft; then
+    case "$(dpkg --print-architecture)" in
+        arm64) DIFFT_TARGET="aarch64-unknown-linux-gnu" ;;
+        amd64) DIFFT_TARGET="x86_64-unknown-linux-gnu" ;;
+        *)     DIFFT_TARGET="" ;;
+    esac
+    if [ -n "$DIFFT_TARGET" ] && have curl && have jq && have tar; then
+        log "base: fetching difftastic ($DIFFT_TARGET)"
+        difft_url=$(curl -fsSL https://api.github.com/repos/Wilfred/difftastic/releases/latest \
+            | jq -r --arg t "$DIFFT_TARGET" '.assets[] | select(.name | endswith($t + ".tar.gz")) | .browser_download_url')
+        if [ -n "$difft_url" ]; then
+            tmp=$(mktemp -d)
+            trap 'rm -rf "$tmp"' EXIT
+            curl -fsSL "$difft_url" -o "$tmp/difft.tar.gz"
+            tar -xzf "$tmp/difft.tar.gz" -C "$tmp"
+            install -m 0755 "$tmp/difft" "$HOME/.local/bin/difft"
+            trap - EXIT; rm -rf "$tmp"
+            ok "installed difft -> ~/.local/bin/difft"
+        else
+            warn "could not resolve difftastic release URL — skipping"
+        fi
+    else
+        warn "skipping difftastic install (unsupported arch or missing curl/jq/tar)"
+    fi
 fi
 
 ok "base: done"
