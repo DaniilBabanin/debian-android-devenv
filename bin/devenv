@@ -223,10 +223,12 @@ _snapshot_entry() {
     if [ -d "$src" ]; then
         mkdir -p "$dst"
         if [ "$engine" = "rsync" ]; then
-            # *.wants/ — systemd enable-state symlink dirs (default.target.wants/, etc.)
-            # are recreated by `systemctl --user enable` in init.sh, and virtio-fs
-            # on Android shared storage can't create symlinks anyway.
-            rsync -a --delete --info=stats1 \
+            # virtio-fs on Android shared storage can't create symlinks, so we
+            # skip them outright with --no-links. *.wants/ (systemd enable-state
+            # symlink dirs) is excluded as a whole because it would be empty
+            # after --no-links anyway; systemctl --user enable in init.sh
+            # recreates it on restore.
+            rsync -a --no-links --delete --info=stats1 \
                 --exclude='*.db-wal' --exclude='*.db-shm' --exclude='*.lock' \
                 --exclude='*.wants/' \
                 "$src/" "$dst/"
@@ -239,7 +241,7 @@ _snapshot_entry() {
         # Regular file (e.g. .bash_history).
         mkdir -p "$(dirname "$dst")"
         if [ "$engine" = "rsync" ]; then
-            rsync -a --info=stats1 -- "$src" "$dst"
+            rsync -a --no-links --info=stats1 -- "$src" "$dst"
         else
             cp -a -- "$src" "$dst"
         fi
