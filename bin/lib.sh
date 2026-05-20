@@ -35,11 +35,25 @@ LINK_DOTFILES=(
 # What gets snapshot/restored instead of symlinked. Anything that does SQLite,
 # WAL, flock(), or write-tmp-then-rename MUST go here, not in LINK_DOTFILES.
 # .bash_history is a file rather than a directory; snapshot/restore handle both.
+#
+# NOTE: ~/.claude/ used to live here, but bulk-snapshotting the whole tree
+# (sessions, file-history, auto-memory, projects/, telemetry, daemon state...)
+# proved unsafe — a restore once left the VM unusable. The two files we still
+# want from inside it (CLAUDE.md, .credentials.json) are handled by
+# SNAPSHOT_FILES below. ~/.claude.json (top-level) has corrupted repeatedly
+# in the past and is not persisted either.
 STATEFUL_DIRS=(
-    .claude
-    .claude.json
     .config
     .bash_history
+)
+
+# Individual files (not directories) to snapshot/restore. Use this for files
+# that live INSIDE a directory we deliberately don't bulk-snapshot — currently
+# the only thing we want to carry across VM rebuilds out of ~/.claude/.
+# Each entry is a path relative to $HOME.
+SNAPSHOT_FILES=(
+    .claude/CLAUDE.md
+    .claude/.credentials.json
 )
 
 # Directories archived as tar.gz under $DEVENV_ROOT/archives/. Use this for

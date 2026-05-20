@@ -24,20 +24,37 @@ done
 # .bash_history out of $DEVENV_HOME. Those entries are now stateful and must
 # be real files/dirs in $HOME, not symlinks into /mnt/shared. Unlink them so
 # `devenv restore` (or a fresh app run) can populate them safely.
+#
+# Also unlink any legacy symlink for the top-level component of a
+# SNAPSHOT_FILES entry — e.g. a leftover `~/.claude -> $DEVENV_HOME/.claude`
+# would cause _restore_file to write CLAUDE.md into the template itself.
+declare -A _legacy_seen=()
+_unlink_legacy() {
+    local name="$1"
+    local dst="$HOME/$name"
+    [ -n "${_legacy_seen[$name]:-}" ] && return 0
+    _legacy_seen[$name]=1
+    [ -L "$dst" ] || return 0
+    target="$(readlink "$dst")"
+    case "$target" in
+        "$DEVENV_HOME/$name"|"$DEVENV_HOME/$name/")
+            warn "unlinking legacy symlink ~/$name -> $target"
+            rm -- "$dst"
+            ;;
+        *)
+            warn "~/$name is a symlink to $target — leaving it alone (not ours)"
+            ;;
+    esac
+}
+
 for stateful in "${STATEFUL_DIRS[@]}"; do
-    dst="$HOME/$stateful"
-    if [ -L "$dst" ]; then
-        target="$(readlink "$dst")"
-        case "$target" in
-            "$DEVENV_HOME/$stateful"|"$DEVENV_HOME/$stateful/")
-                warn "unlinking legacy symlink ~/$stateful -> $target"
-                rm -- "$dst"
-                ;;
-            *)
-                warn "~/$stateful is a symlink to $target — leaving it alone (not ours)"
-                ;;
-        esac
-    fi
+    _unlink_legacy "$stateful"
+done
+
+# Top-level component of each SNAPSHOT_FILES entry (e.g. `.claude` from
+# `.claude/CLAUDE.md`).
+for snap_rel in "${SNAPSHOT_FILES[@]}"; do
+    _unlink_legacy "${snap_rel%%/*}"
 done
 
 # Put `devenv` on PATH via ~/.local/bin

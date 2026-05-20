@@ -36,9 +36,11 @@ bash /mnt/shared/debian-env/bootstrap.sh
 
 That:
 
-1. Symlinks `~/.bashrc`, `~/.bash_history`, `~/.claude/`, etc. into `$HOME`.
-2. Puts `devenv` on PATH at `~/.local/bin/devenv`.
-3. Runs all install modules (`base`, `node`, `python`, `claude`).
+1. Symlinks read-mostly dotfiles (`~/.bashrc`, `~/.gitconfig`, …) into `$HOME`.
+2. Restores stateful dirs (`~/.config`, `~/.bash_history`), tar archives (`~/.ssh`), and per-file snapshots (`~/.claude/CLAUDE.md`, `~/.claude/.credentials.json`) — seeding `~/.claude/CLAUDE.md` from the shipped template on first run.
+3. Puts `devenv` on PATH at `~/.local/bin/devenv`.
+4. Runs the essential install modules (`base`, `claude`, `claude-plugins`). Pass `--with-node` / `--with-python` / `--all` to include the others.
+5. Snapshots the live state back to `state/` and `archives/` so the next rebuild has fresh data.
 
 Then open a new shell (or `source ~/.bashrc`).
 
@@ -58,90 +60,47 @@ devenv sync                       # if home/ is a git repo, show drift
 
 Anything you'd otherwise have to rewrite from memory after a reinstall:
 
-| Path | Purpose |
-|---|---|
-| `home/.bashrc`, `.bash_profile`, `.profile` | shell config |
-| `home/.bash_history` | full history; flushed every command |
-| `home/.inputrc` | readline tweaks |
-| `home/.gitconfig` | git identity + aliases |
-| `home/.npmrc` | npm config |
-| `home/.config/` | XDG configs (nvim, etc.) |
-| `home/.claude/` | Claude Code creds, MCP servers, settings |
-| `archives/ssh.tar.gz` | `~/.ssh` — keys, `known_hosts`, `authorized_keys` (tar preserves 700/600 perms across FUSE) |
+| Path | Mechanism | Purpose |
+|---|---|---|
+| `home/.bashrc`, `.bash_profile`, `.profile` | symlink | shell config |
+| `home/.inputrc` | symlink | readline tweaks |
+| `home/.gitconfig` | symlink | git identity + aliases |
+| `home/.npmrc` | symlink | npm config |
+| `state/home/.config/` | snapshot dir | XDG configs (nvim, systemd --user units, etc.) |
+| `state/home/.bash_history` | snapshot file | full history; flushed every command |
+| `state/files/.claude/CLAUDE.md` | snapshot file | Claude Code global guidance (seeded from `home/.claude/CLAUDE.md` on first run, then snapshotted) |
+| `state/files/.claude/.credentials.json` | snapshot file | Claude Code auth token (chmod 600 on restore) |
+| `archives/ssh.tar.gz` | tar archive | `~/.ssh` — keys, `known_hosts`, `authorized_keys` (tar preserves 700/600 perms across FUSE) |
 
 What doesn't persist, because reinstalling is cheap and the modules re-establish it:
 
 - apt packages (re-installed by `install-base`)
 - `~/.nvm/` and Node binaries (re-installed by `install-node`)
 - pipx envs (re-installed by `install-python`)
-- the Claude binary itself (re-installed by `install-claude`, though creds in `~/.claude/` persist)
+- the Claude binary itself (re-installed by `install-claude`)
+- Claude Code plugins, marketplaces, and user-installed skills (re-installed by `install-claude-plugins` from manifests in `modules/claude-{marketplaces,plugins,skills}.txt`)
+- the rest of `~/.claude/` — sessions, `projects/`, the auto-memory system, `file-history/`, `settings.json`, `~/.claude.json`, telemetry. **`/resume` does not survive a VM rebuild.** A bulk `~/.claude/` snapshot once corrupted the VM, so persistence inside that directory is now opt-in per file via `SNAPSHOT_FILES` in `bin/lib.sh`. The seeded `~/.claude/CLAUDE.md` instructs Claude Code to track durable project state in project-local `CLAUDE.md` files instead of relying on the auto-memory system.
 
 ## Telling Claude about the installed tools
 
-If you use Claude Code in this environment, paste the block below into your
-user-level `~/.claude/CLAUDE.md`. It tells the agent what's on PATH so it
-reaches for the right tool instead of falling back to whatever it knows from
-training, and points it at this repo's wishlist file for things it wishes were
-installed.
+The repo ships `home/.claude/CLAUDE.md`, which seeds `~/.claude/CLAUDE.md`
+the first time `bootstrap.sh` runs on a fresh VM (after that, your edits to
+`~/.claude/CLAUDE.md` are snapshotted back via `SNAPSHOT_FILES`). It tells the
+agent:
 
-````markdown
-# Missing tools
+- Track durable project state in **project-local** `CLAUDE.md` files at the
+  working-directory root, since `~/.claude/projects/<wd>/{sessions,memory}/`
+  are wiped on every VM rebuild and `/resume` doesn't survive.
+- Never use `cp` when any path is under `/mnt/shared` — use `rsync` instead.
+  The virtio-fs bridge can crash the VM mid-copy.
+- What CLI tools are on PATH (full inventory mirroring the install modules),
+  so Claude reaches for the right tool instead of falling back to whatever it
+  knows from training.
+- Where to append missing-tool requests
+  (`/mnt/shared/debian-env/tool-wishlist.md`).
 
-If you wish a CLI tool were installed while working on a task, append it to
-`/mnt/shared/debian-env/tool-wishlist.md` (one line:
-`- tool — what it does / task that needed it / YYYY-MM-DD`).
-The user reviews this list before updating the dev env.
-
-# Available CLI tools
-
-## Search & inspection
-- `rg` (ripgrep) — default for code search; faster than `grep -r`, respects `.gitignore`
-- `fd` — fast `find` replacement, `.gitignore`-aware (symlinked from `fdfind`); prefer over `find` for name-based lookups
-- `ast-grep` — structural AST-based code search; use for "find all callers of X with arg shape Y" patterns that regex handles poorly. Always invoke as `ast-grep`; the upstream `sg` alias collides with Debian's `/usr/bin/sg` (newgrp)
-- `ctags` (universal-ctags) — generate a `tags` symbol index (`ctags -R`) for fast jump-to-def via `rg '^Symbol\b' tags`
-- `tokei` — fast per-language LOC / file count for a quick repo overview
-- `jq` — JSON parsing/filtering (APIs, configs, `package.json`)
-- `yq` — YAML querying (wraps `jq`); targeted reads of GH Actions / k8s / compose / pre-commit configs without Read-ing whole files
-- `dasel` — multi-format (TOML/JSON/YAML/XML) querying; reach for `pyproject.toml`, `Cargo.toml`, `wrangler.toml`
-- `sqlite3` — query `.db`/`.sqlite` files directly instead of writing throwaway Python
-- `bat` — syntax-highlighted file display (symlinked from `batcat`)
-- `tree` — directory overview (`tree -L 2 -I node_modules`)
-- `fzf` — interactive fuzzy finder; useful in pipes
-- `file` — identify unknown file types before opening
-
-## Network & transfer
-- `curl` / `wget` — HTTP fetches and downloads
-- `gh` — GitHub CLI; PR/issue/run/release ops, repo queries via `gh api`
-- `rsync` — incremental/remote copy; better than `cp -r` for large or remote trees
-- `ssh` / `scp` / `ssh-keygen` — remote shells, keys, secure copy
-
-## Archives & crypto
-- `zip` / `unzip`, `tar`, `gzip` — archives
-- `gpg` — signature verification, signing, encryption
-
-## Build & binaries
-- `git`, `make`, `gcc`/`g++` (build-essential) — version control and native compilation
-
-## Lint, diff & secret scan (verify before declaring done)
-- `shellcheck` — lint shell scripts before executing; catches quoting/glob errors at author time, not runtime
-- `ruff` — fast Python linter/formatter; verify Python diffs are clean before claiming done
-- `gitleaks` — scan for committed secrets; run before staging files that may contain credentials (`gitleaks detect --no-banner`)
-- `difft` (difftastic) — structural/syntax-aware diff; collapses formatting-only churn when reviewing changes
-
-## Debugging & perf
-- `strace` — trace syscalls of hanging or opaque processes; evidence over speculation during debugging
-- `hyperfine` — command-line benchmarking with warmups and statistical output
-
-## Scripting languages
-- `python3`, `perl` — available for ad-hoc scripting / one-liners
-
-## Process & session
-- `tmux` — long-lived sessions, split panes (for Claude background work prefer `run_in_background`)
-- `expect` — drive interactive prompts non-interactively; avoids "please run this yourself" handoffs when a CLI insists on a TTY
-````
-
-The wishlist path assumes you cloned this repo to `/mnt/shared/debian-env`;
-update the path in the pasted block if you cloned somewhere else.
+Edit `home/.claude/CLAUDE.md` to tailor it. If you cloned somewhere other
+than `/mnt/shared/debian-env`, update the path references in that file.
 
 ## Adding a module
 
@@ -157,14 +116,28 @@ Module contract:
 
 ## Adding a dotfile to persist
 
-1. Put the file under `home/` (or a subdirectory).
-2. Add its top-level name to the `TOPLEVEL` array in `bin/init.sh`.
-3. Run `devenv init` to link it.
+Pick the right mechanism for the file:
 
-Whole directories link as one symlink, so anything underneath is automatic.
+- **Read-mostly dotfile** (`.bashrc`, `.gitconfig`, …) — put under `home/`, add its name to `LINK_DOTFILES` in `bin/lib.sh`, run `devenv init` to symlink it into `$HOME`. Whole directories are linked as one symlink, so anything underneath is automatic.
+- **Stateful directory** (XDG dirs, SQLite-backed apps) — add to `STATEFUL_DIRS` in `bin/lib.sh`. Managed by `devenv snapshot` / `devenv restore` via rsync into `state/home/<name>/`. Don't put anything bulk-misbehaving here (large opaque dir, frequent churn, daemons writing while a snapshot runs) — that's how the original `~/.claude/` corruption happened.
+- **Single file inside a directory you deliberately don't bulk-snapshot** (e.g. `~/.claude/CLAUDE.md`) — add the `$HOME`-relative path to `SNAPSHOT_FILES` in `bin/lib.sh`. Snapshot/restore handles one file at a time, writing to `state/files/<path>`. A matching file under `home/<path>` acts as a first-run seed template (used by `devenv restore` when no snapshot exists yet).
+- **Anything needing strict mode bits across FUSE/sdcardfs** (`~/.ssh`, `~/.gnupg`) — add to `ARCHIVE_DIRS` in `bin/lib.sh`. Stored as `archives/<name>.tar.gz` so perms survive the round-trip.
+
+## Adding a Claude Code plugin or skill
+
+Plugins and skills aren't persisted directly — they're reinstalled from manifests on each rebuild via `modules/install-claude-plugins.sh`:
+
+- Marketplace: append a source to `modules/claude-marketplaces.txt` (e.g. `anthropics/claude-plugins-official` or any GitHub `owner/repo`).
+- Plugin: append `<plugin>@<marketplace>` to `modules/claude-plugins.txt`.
+- Skill: append `<git-url> [name]` to `modules/claude-skills.txt` (cloned shallow into `~/.claude/skills/<name>`).
+
+`devenv install claude-plugins` (re)runs the install. Idempotent — already-installed entries are skipped, so it's safe to re-run after editing the manifests.
 
 ## Risks and known limits
 
 - `/mnt/shared/` on Android is typically FUSE/sdcardfs and may not honor unix mode bits. That's why `~/.ssh` lives in `archives/ssh.tar.gz` (tar bakes 700/600 into the archive metadata) instead of `home/.ssh/` (which would lose perms on the FUSE round-trip). `~/.gnupg` would need the same treatment; see `ARCHIVE_DIRS` in `bin/lib.sh` to add more.
+- Never use `cp` when any path is under `/mnt/shared` — use `rsync` instead. The virtio-fs / sdcardfs bridge can crash the VM mid-copy (observed: zero-length destinations, hang, full app reset).
+- `~/.claude/` is **not** bulk-snapshotted. An earlier version of this repo snapshotted the whole tree (sessions, file-history, auto-memory, projects/, telemetry, daemon state…) and a restore corrupted the VM badly enough to require a full Debian reinstall. Today, only `~/.claude/CLAUDE.md` and `~/.claude/.credentials.json` round-trip via `SNAPSHOT_FILES`, and plugins/skills reinstall from manifests on each rebuild. The shipped CLAUDE.md tells the Claude Code agent to track durable project state in project-local `CLAUDE.md` files instead of relying on the auto-memory system at `~/.claude/projects/<wd>/memory/` (which is wiped on rebuild). `/resume` does not survive a rebuild.
+- `~/.claude.json` (the top-level Claude config file) corrupted repeatedly in past versions of this setup and is no longer persisted. MCP server registrations live there; re-add them after a rebuild if needed.
 - Concurrent shells fight for `.bash_history`. The `history -a` PROMPT_COMMAND in `.bashrc` mitigates loss, but two simultaneous edits can still interleave.
 - `devenv init` never overwrites real files. It backs them up to `~/.devenv-backup/<timestamp>/`, so it's safe to re-run.

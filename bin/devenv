@@ -68,7 +68,7 @@ cmd_install() {
     local mods=()
     if [ "$1" = "all" ]; then
         # Default order — modules with deps must come after their deps.
-        local preferred=(base node python claude)
+        local preferred=(base node python claude claude-plugins)
         local available; available="$(list_modules)"
         local m
         for m in "${preferred[@]}"; do
@@ -96,6 +96,18 @@ _in_stateful() {
     return 1
 }
 
+# True if $1 is the top-level component of any SNAPSHOT_FILES entry — i.e.
+# this directory exists in $DEVENV_HOME only as a seed template for files
+# managed via _restore_file, not as something to symlink into $HOME.
+_is_snapshot_file_root() {
+    local needle="$1" rel top
+    for rel in "${SNAPSHOT_FILES[@]}"; do
+        top="${rel%%/*}"
+        [ "$top" = "$needle" ] && return 0
+    done
+    return 1
+}
+
 cmd_doctor() {
     # Avoid iterating literal glob patterns when a match set is empty, and
     # include dotfiles in `*` so we don't need parallel `.foo` patterns.
@@ -110,6 +122,8 @@ cmd_doctor() {
         rel="$(basename "$entry")"
         # STATEFUL_DIRS are managed by snapshot/restore, not symlinked.
         if _in_stateful "$rel"; then continue; fi
+        # SNAPSHOT_FILES roots (e.g. ~/.claude/) are seed templates only.
+        if _is_snapshot_file_root "$rel"; then continue; fi
         src="$DEVENV_HOME/$rel"
         dst="$HOME/$rel"
         if [ -L "$dst" ] && [ "$(readlink "$dst")" = "$src" ]; then
@@ -149,6 +163,20 @@ cmd_doctor() {
                         if have "$t"; then ok "python: $t"; else warn "python: missing $t"; fails=$((fails+1)); fi
                     done ;;
             claude) if have claude; then ok "claude: $(claude --version 2>&1 | head -1)"; else warn "claude: missing (run devenv install claude)"; fails=$((fails+1)); fi ;;
+            claude-plugins)
+                if have claude; then
+                    local pcount scount
+                    pcount="$(claude plugin list 2>/dev/null | grep -cE '^[[:space:]]*[a-zA-Z0-9_-]+@' || true)"
+                    ok "claude-plugins: ${pcount:-0} installed"
+                    if [ -d "$HOME/.claude/skills" ]; then
+                        scount="$(find "$HOME/.claude/skills" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | wc -l || true)"
+                    else
+                        scount=0
+                    fi
+                    ok "claude-skills: ${scount:-0} cloned"
+                else
+                    warn "claude-plugins: claude CLI missing"; fails=$((fails+1))
+                fi ;;
         esac
     done < <(list_modules)
 
@@ -178,6 +206,20 @@ cmd_doctor() {
             ok "archive: ~/$a -> ${path##*/} (${mtime:-?})"
         else
             warn "archive: no ${path##*/} yet (run: devenv snapshot)"
+        fi
+    done
+
+    step "snapshot files"
+    local rel snap_path
+    for rel in "${SNAPSHOT_FILES[@]}"; do
+        snap_path="$(_snapshot_file_path "$rel")"
+        if [ -f "$snap_path" ]; then
+            mtime="$(stat -c '%y' "$snap_path" 2>/dev/null | cut -d. -f1)"
+            ok "snapshot-file: ~/$rel (${mtime:-?})"
+        elif [ -f "$DEVENV_HOME/$rel" ]; then
+            log "snapshot-file: ~/$rel will seed from template on next restore"
+        else
+            warn "snapshot-file: no snapshot or template for ~/$rel"
         fi
     done
 
@@ -244,6 +286,70 @@ _archive_path() {
     # archives/<name-without-leading-dot>.tar.gz so the directory listing reads
     # ssh.tar.gz / gnupg.tar.gz instead of .ssh.tar.gz / .gnupg.tar.gz.
     printf '%s/%s.tar.gz\n' "$DEVENV_ARCHIVES" "${1#.}"
+}
+
+# Snapshot/restore location for SNAPSHOT_FILES entries — mirrors the file's
+# HOME-relative path under $DEVENV_SNAPSHOT_DIR/files/. Kept separate from
+# state/home/ (used by STATEFUL_DIRS) so the two mechanisms can't collide.
+_snapshot_file_path() {
+    printf '%s/files/%s\n' "$DEVENV_SNAPSHOT_DIR" "$1"
+}
+
+# Copy a single file from $HOME into the snapshot tree. Uses rsync (cp can
+# crash mid-write on the /mnt/shared FUSE/sdcardfs bridge).
+_snapshot_file() {
+    local rel="$1"
+    local src="$HOME/$rel"
+    local dst; dst="$(_snapshot_file_path "$rel")"
+
+    if [ -L "$src" ]; then
+        warn "snapshot-file: ~/$rel is a symlink; skipping"
+        return 0
+    fi
+    if [ ! -f "$src" ]; then
+        log "snapshot-file: ~/$rel does not exist; skipping"
+        return 0
+    fi
+
+    mkdir -p "$(dirname "$dst")"
+    rsync -a --no-links --info=progress2 -- "$src" "$dst"
+    ok "snapshot-file: ~/$rel"
+}
+
+# Restore a single file into $HOME. Falls back to $DEVENV_HOME/<rel> as a
+# template when no snapshot copy exists yet (first-run seeding of CLAUDE.md).
+# Returns 0 if anything was restored, 1 if no source was found.
+_restore_file() {
+    local rel="$1"
+    local dst="$HOME/$rel"
+    local snap; snap="$(_snapshot_file_path "$rel")"
+    local tmpl="$DEVENV_HOME/$rel"
+    local src=""
+
+    if [ -f "$snap" ]; then
+        src="$snap"
+    elif [ -f "$tmpl" ]; then
+        src="$tmpl"
+        log "restore-file: no snapshot for ~/$rel, seeding from template $tmpl"
+    else
+        return 1
+    fi
+
+    mkdir -p "$(dirname "$dst")"
+    if [ -L "$dst" ]; then
+        warn "restore-file: ~/$rel was a symlink ($(readlink "$dst")); removing before restore"
+        rm -- "$dst"
+    fi
+    rsync -a --info=progress2 -- "$src" "$dst"
+
+    # Tighten perms on known-sensitive files. rsync from /mnt/shared loses
+    # mode bits anyway, so we set them explicitly per file.
+    case "$rel" in
+        .claude/.credentials.json) chmod 600 "$dst" 2>/dev/null || true ;;
+    esac
+
+    ok "restored ~/$rel"
+    return 0
 }
 
 # Snapshot ~/<name> into a tar.gz at archives/<name>.tar.gz. Perms are
@@ -345,6 +451,11 @@ cmd_snapshot() {
         _snapshot_archive "$name"
     done
 
+    local rel
+    for rel in "${SNAPSHOT_FILES[@]}"; do
+        _snapshot_file "$rel"
+    done
+
     if have dpkg; then
         dpkg --get-selections >"$DEVENV_SNAPSHOT_DIR/dpkg-selections.txt"
         ok "wrote dpkg-selections.txt ($(wc -l <"$DEVENV_SNAPSHOT_DIR/dpkg-selections.txt") lines)"
@@ -426,6 +537,17 @@ cmd_restore() {
             restored+=("$name")
         else
             skipped+=("$name")
+        fi
+    done
+
+    # SNAPSHOT_FILES — single files from $DEVENV_SNAPSHOT_DIR/files/<rel>,
+    # falling back to $DEVENV_HOME/<rel> template if no snapshot yet.
+    local rel
+    for rel in "${SNAPSHOT_FILES[@]}"; do
+        if _restore_file "$rel"; then
+            restored+=("$rel")
+        else
+            skipped+=("$rel")
         fi
     done
 

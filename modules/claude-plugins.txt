@@ -1,0 +1,10 @@
+# Claude Code plugins to install on each rebuild.
+# Format: <plugin>@<marketplace> per line (the marketplace must appear in
+# claude-marketplaces.txt). Comments (#) and blank lines are ignored.
+#
+# Discover plugins with `claude plugin marketplace list` and
+# `claude plugin install --help`. Examples (commented; uncomment to use):
+#
+# superpowers@claude-plugins-official
+# code-review@claude-plugins-official
+# cloudflare@claude-plugins-official

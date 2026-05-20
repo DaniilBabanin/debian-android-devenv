@@ -82,14 +82,26 @@ fi
 
 # ---- step 2: restore -----------------------------------------------------
 
-# Restore if either an rsync snapshot or any tar archive exists. Archives
-# (e.g. ~/.ssh) may be present even on a first run where snapshot.ts isn't.
+# Restore if either an rsync snapshot, any tar archive, OR any per-file
+# snapshot exists. Archives (e.g. ~/.ssh) and SNAPSHOT_FILES entries
+# (e.g. ~/.claude/CLAUDE.md) may be present on a first run where snapshot.ts
+# isn't, and SNAPSHOT_FILES also has template-seed fallback under
+# $DEVENV_HOME so a clean install still gets a starter CLAUDE.md.
 has_state=0
 [ -f "$DEVENV_SNAPSHOT_DIR/snapshot.ts" ] && has_state=1
 for __arch in "$DEVENV_ARCHIVES"/*.tar.gz; do
     [ -f "$__arch" ] && { has_state=1; break; }
 done
 unset __arch
+if [ "$has_state" = 0 ] && [ -d "$DEVENV_SNAPSHOT_DIR/files" ]; then
+    has_state=1
+fi
+if [ "$has_state" = 0 ]; then
+    for __rel in "${SNAPSHOT_FILES[@]}"; do
+        [ -f "$DEVENV_HOME/$__rel" ] && { has_state=1; break; }
+    done
+    unset __rel
+fi
 if [ "$has_state" = 1 ]; then
     devenv restore
 else
@@ -110,6 +122,8 @@ case "$mode" in
         mods=(base claude)
         [ "$with_node"   = 1 ] && mods+=(node)
         [ "$with_python" = 1 ] && mods+=(python)
+        # claude-plugins must come after claude (uses the CLI it installs).
+        mods+=(claude-plugins)
         devenv install "${mods[@]}"
         ;;
 esac

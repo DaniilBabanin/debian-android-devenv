@@ -2,7 +2,8 @@
 # install; if you clone this repo into your working /mnt/shared/debian-env,
 # these patterns keep your credentials, history, and ssh keys out of git.
 
-# Snapshot tree (contains a full copy of ~/.claude, .bash_history, etc.)
+# Snapshot tree (full copies of stateful dirs + per-file snapshots; may
+# include credentials in state/files/.claude/.credentials.json — never commit).
 state/
 
 # Archives: ~/.ssh, ~/.gnupg, anything else baked as tar.gz
@@ -11,8 +12,11 @@ archives/
 # Module install sentinels
 *.installed
 
-# Stateful dotfile dirs and files when present at the repo root
-home/.claude/
+# Stateful dotfile dirs and files when present at the repo root.
+# home/.claude/ is ignored except for the shipped CLAUDE.md template, which
+# seeds ~/.claude/CLAUDE.md on the first bootstrap of a fresh VM.
+home/.claude/*
+!home/.claude/CLAUDE.md
 home/.claude.json
 home/.bash_history
 home/.config/pulse/

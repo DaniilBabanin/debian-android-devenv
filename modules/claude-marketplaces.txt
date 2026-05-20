@@ -1,0 +1,9 @@
+# Claude Code plugin marketplaces to register on each rebuild.
+# Format: one source per line. <source> can be a GitHub `owner/repo`,
+# a URL, or a local path (see `claude plugin marketplace add --help`).
+# Comments (#) and blank lines are ignored.
+#
+# The official Anthropic marketplace is added by default. Add others below
+# if you use plugins from third-party marketplaces.
+
+anthropics/claude-plugins-official

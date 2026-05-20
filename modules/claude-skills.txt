@@ -1,0 +1,7 @@
+# User-installed Claude Code skills.
+# Format: <git-url> [name]   — name defaults to the repo basename if omitted.
+# Each line is `git clone --depth 1`d into ~/.claude/skills/<name>.
+# Comments (#) and blank lines are ignored.
+#
+# Example (commented; uncomment to use):
+# https://github.com/blader/humanizer.git
