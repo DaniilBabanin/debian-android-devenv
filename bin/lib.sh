@@ -41,7 +41,9 @@ LINK_DOTFILES=(
 # proved unsafe — a restore once left the VM unusable. The two files we still
 # want from inside it (CLAUDE.md, .credentials.json) are handled by
 # SNAPSHOT_FILES below. ~/.claude.json (top-level) has corrupted repeatedly
-# in the past and is not persisted either.
+# when snapshotted whole, so it is handled by the JSON_MERGE mechanism below
+# — we extract only the keys needed to stay logged in and merge them back on
+# restore, never replacing the live file in bulk.
 STATEFUL_DIRS=(
     .config
     .bash_history
@@ -54,6 +56,17 @@ STATEFUL_DIRS=(
 SNAPSHOT_FILES=(
     .claude/CLAUDE.md
     .claude/.credentials.json
+)
+
+# Keys to extract from ~/.claude.json and re-merge on restore. We don't
+# snapshot the whole file because past attempts corrupted it. The auth subset
+# is what's needed for `claude` to consider itself logged in without
+# re-prompting: oauthAccount + userID match the refresh token in
+# .credentials.json, and hasCompletedOnboarding skips the onboarding flow.
+CLAUDE_JSON_AUTH_KEYS=(
+    oauthAccount
+    userID
+    hasCompletedOnboarding
 )
 
 # Directories archived as tar.gz under $DEVENV_ROOT/archives/. Use this for

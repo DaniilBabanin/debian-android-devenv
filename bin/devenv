@@ -223,6 +223,15 @@ cmd_doctor() {
         fi
     done
 
+    step "claude.json auth subset"
+    snap_path="$(_claude_json_auth_path)"
+    if [ -f "$snap_path" ]; then
+        mtime="$(stat -c '%y' "$snap_path" 2>/dev/null | cut -d. -f1)"
+        ok "claude-json-auth: ${snap_path##*/} (${mtime:-?}) keys=${CLAUDE_JSON_AUTH_KEYS[*]}"
+    else
+        warn "claude-json-auth: not snapshotted yet (run \`devenv snapshot\` while logged in)"
+    fi
+
     echo
     if [ $fails -eq 0 ]; then ok "doctor: all clear"; else warn "doctor: $fails issue(s)"; return 1; fi
 }
@@ -293,6 +302,73 @@ _archive_path() {
 # state/home/ (used by STATEFUL_DIRS) so the two mechanisms can't collide.
 _snapshot_file_path() {
     printf '%s/files/%s\n' "$DEVENV_SNAPSHOT_DIR" "$1"
+}
+
+# Where the extracted auth subset of ~/.claude.json is parked.
+_claude_json_auth_path() {
+    printf '%s/files/.claude/claude-json-auth.json\n' "$DEVENV_SNAPSHOT_DIR"
+}
+
+# Snapshot the auth keys from ~/.claude.json into a small JSON file. We do not
+# snapshot the whole file (history of corruption on the shared mount); only
+# the keys in CLAUDE_JSON_AUTH_KEYS get carried across rebuilds.
+_snapshot_claude_json() {
+    local src="$HOME/.claude.json"
+    local dst; dst="$(_claude_json_auth_path)"
+
+    if [ ! -f "$src" ]; then
+        log "snapshot-claude-json: ~/.claude.json missing; skipping"
+        return 0
+    fi
+    if ! have jq; then
+        warn "snapshot-claude-json: jq missing; cannot extract auth subset"
+        return 0
+    fi
+
+    mkdir -p "$(dirname "$dst")"
+    # Build a jq object literal from CLAUDE_JSON_AUTH_KEYS: {oauthAccount, userID, ...}
+    local filter; filter="$(printf '%s, ' "${CLAUDE_JSON_AUTH_KEYS[@]}" | sed 's/, $//')"
+    local tmp="$dst.tmp.$$"
+    if jq "{$filter}" "$src" > "$tmp"; then
+        mv -- "$tmp" "$dst"
+        chmod 600 "$dst" 2>/dev/null || true
+        ok "snapshot-claude-json: ~/.claude.json (keys: ${CLAUDE_JSON_AUTH_KEYS[*]})"
+    else
+        rm -f -- "$tmp"
+        warn "snapshot-claude-json: jq failed; auth subset not updated"
+    fi
+}
+
+# Restore the auth subset by merging into the live ~/.claude.json (or seeding
+# a fresh one if it doesn't exist yet). Snapshot keys win on conflict, so the
+# restored oauthAccount/userID match the restored .credentials.json.
+_restore_claude_json() {
+    local snap; snap="$(_claude_json_auth_path)"
+    local live="$HOME/.claude.json"
+
+    [ -f "$snap" ] || return 1
+    if ! have jq; then
+        warn "restore-claude-json: jq missing; cannot merge auth subset"
+        return 1
+    fi
+
+    mkdir -p "$(dirname "$live")"
+    local tmp="$live.devenv-restore.$$"
+    if [ -f "$live" ]; then
+        # live * snap → snap's keys override live's. Write temp, atomic rename.
+        if ! jq -s '.[0] * .[1]' "$live" "$snap" > "$tmp"; then
+            rm -f -- "$tmp"
+            warn "restore-claude-json: jq merge failed; ~/.claude.json untouched"
+            return 1
+        fi
+    else
+        # Fresh — just stage the snapshot subset as the seed file.
+        cp -- "$snap" "$tmp"
+    fi
+    mv -- "$tmp" "$live"
+    chmod 600 "$live" 2>/dev/null || true
+    ok "restored ~/.claude.json (merged auth subset)"
+    return 0
 }
 
 # Copy a single file from $HOME into the snapshot tree. Uses rsync (cp can
@@ -456,6 +532,8 @@ cmd_snapshot() {
         _snapshot_file "$rel"
     done
 
+    _snapshot_claude_json
+
     if have dpkg; then
         dpkg --get-selections >"$DEVENV_SNAPSHOT_DIR/dpkg-selections.txt"
         ok "wrote dpkg-selections.txt ($(wc -l <"$DEVENV_SNAPSHOT_DIR/dpkg-selections.txt") lines)"
@@ -550,6 +628,13 @@ cmd_restore() {
             skipped+=("$rel")
         fi
     done
+
+    # JSON-merge files (currently just ~/.claude.json auth subset).
+    if _restore_claude_json; then
+        restored+=(".claude.json[auth]")
+    else
+        skipped+=(".claude.json[auth]")
+    fi
 
     if [ ${#restored[@]} -gt 0 ]; then
         ok "restored: ${restored[*]}"

@@ -2,17 +2,22 @@
 
 This Debian VM is rebuilt frequently. The persistence layer at
 `/mnt/shared/debian-env/` (or wherever you cloned this repo) carries only this
-`CLAUDE.md` and `~/.claude/.credentials.json` across full rebuilds. Everything
-else under `~/.claude/` is wiped on each rebuild:
+`CLAUDE.md`, `~/.claude/.credentials.json`, and the auth subset of
+`~/.claude.json` (`oauthAccount`, `userID`, `hasCompletedOnboarding` — merged
+back into the live file on restore so `claude` stays logged in) across full
+rebuilds. Everything else under `~/.claude/` is wiped on each rebuild:
 
 - `~/.claude/projects/<wd>/sessions/` — **`/resume` does not survive a rebuild.**
 - `~/.claude/projects/<wd>/memory/` — the auto-memory system is ephemeral here.
 - `~/.claude/projects/<wd>/file-history/`, `tasks/`, `daemon/`, `shell-snapshots/`.
-- `~/.claude/settings.json`, `~/.claude.json`, MCP server registrations.
+- `~/.claude/settings.json`, the bulk of `~/.claude.json` (MCP server
+  registrations and other non-auth fields are wiped).
 
 This is a deliberate tradeoff: a bulk `~/.claude/` restore once corrupted the
-VM, so persistence inside it is now opt-in per-file (see `SNAPSHOT_FILES` in
-`bin/lib.sh`). Plan your work accordingly:
+VM, and snapshotting `~/.claude.json` whole corrupted that file. Persistence
+inside `~/.claude/` is now opt-in per-file (see `SNAPSHOT_FILES` in
+`bin/lib.sh`), and `~/.claude.json` is handled by an auth-subset merge
+(`CLAUDE_JSON_AUTH_KEYS` in the same file). Plan your work accordingly:
 
 - **Write durable project context into a project-local `CLAUDE.md`** at the
   working-directory root, not into the auto-memory system. The auto-memory
