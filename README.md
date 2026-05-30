@@ -40,7 +40,7 @@ That:
 2. Restores stateful dirs (`~/.config`, `~/.bash_history`), tar archives (`~/.ssh`), per-file snapshots (`~/.claude/CLAUDE.md`, `~/.claude/.credentials.json`), and the auth subset of `~/.claude.json` merged back into the live file so `claude` stays logged in — seeding `~/.claude/CLAUDE.md` from the shipped template on first run.
 3. Puts `devenv` on PATH at `~/.local/bin/devenv`.
 4. Runs the essential install modules (`base`, `claude`, `claude-plugins`). Pass `--with-node` / `--with-python` / `--all` to include the others.
-5. Snapshots the live state back to `state/` and `archives/` so the next rebuild has fresh data.
+5. Snapshots the live state into a new versioned `snapshots/<timestamp>/` (keeping the 3 newest) so the next rebuild has fresh, valid-by-construction data — and a rollback target if it ever breaks.
 
 Then open a new shell (or `source ~/.bashrc`).
 
@@ -54,6 +54,8 @@ devenv install all                # full toolchain
 devenv doctor                     # verify symlinks + tool availability
 devenv init                       # re-link dotfiles (idempotent, safe)
 devenv sync                       # if home/ is a git repo, show drift
+devenv snapshots                  # list retained snapshot versions (newest first)
+devenv restore --rollback         # restore the previous version (after a bad snapshot)
 ```
 
 ## What persists
@@ -81,6 +83,30 @@ What doesn't persist, because reinstalling is cheap and the modules re-establish
 - the Claude binary itself (re-installed by `install-claude`)
 - Claude Code plugins, marketplaces, and user-installed skills (re-installed by `install-claude-plugins` from manifests in `modules/claude-{marketplaces,plugins,skills}.txt`)
 - the rest of `~/.claude/` — sessions, `projects/`, the auto-memory system, `file-history/`, `settings.json`, telemetry. The bulk of `~/.claude.json` is also wiped (only the auth subset listed above survives, merged back into a fresh file on restore). **`/resume` does not survive a VM rebuild.** A bulk `~/.claude/` snapshot once corrupted the VM, so persistence inside that directory is now opt-in per file via `SNAPSHOT_FILES` in `bin/lib.sh`. The seeded `~/.claude/CLAUDE.md` instructs Claude Code to track durable project state in project-local `CLAUDE.md` files instead of relying on the auto-memory system.
+
+## Snapshots & rollback
+
+Snapshots are **versioned**. Each `devenv snapshot` writes a new
+`snapshots/<timestamp>/` directory and keeps the **3 newest**. `bootstrap.sh`
+takes a snapshot automatically as its final step, so every retained version
+comes from a system that just booted successfully — valid by construction. A
+`meta` file written last marks a version complete (the shared mount has no
+atomic rename).
+
+- `devenv snapshots` — list the retained versions, newest first; the newest is
+  what a plain restore uses.
+- `devenv restore` — restore the newest version (this is what `bootstrap.sh`
+  does).
+- `devenv restore --rollback` — restore the version before newest. Use this when
+  a fresh `bootstrap.sh` restored a snapshot that breaks the VM.
+- `devenv restore --rollback=2` — go two versions back.
+- `bash bootstrap.sh --rollback[=N]` — same, during a full rebuild.
+
+The first run of the versioned `devenv snapshot` migrates any pre-existing
+single-copy snapshot (`state/` + `archives/ssh.tar.gz`) into `snapshots/` as
+version 1, so no existing state is lost. There is no shutdown-time snapshot:
+capturing state at an arbitrary (possibly broken) moment is exactly what the
+versioned, boot-only model avoids.
 
 ## Telling Claude about the installed tools
 

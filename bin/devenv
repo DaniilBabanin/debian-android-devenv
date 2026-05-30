@@ -6,8 +6,9 @@
 #   devenv list                          list available modules and installed state
 #   devenv doctor                        verify symlinks + tool availability
 #   devenv sync                          report drift if home/ is a git repo
-#   devenv snapshot                      copy STATEFUL_DIRS from $HOME into $DEVENV_ROOT/state
-#   devenv restore                       copy STATEFUL_DIRS from $DEVENV_ROOT/state into $HOME
+#   devenv snapshot                      write a new versioned snapshot under $DEVENV_ROOT/snapshots (keeps 3)
+#   devenv snapshots                     list retained snapshot versions (newest first)
+#   devenv restore [--rollback[=N]]      restore newest snapshot version (or N back) into $HOME
 #   devenv help                          show this
 
 set -euo pipefail
@@ -31,14 +32,17 @@ Commands:
   list                           show modules and which are marked installed
   doctor                         verify symlinks and tool availability
   sync                           if home/ is a git repo, show pending changes
-  snapshot                       copy STATEFUL_DIRS into \$DEVENV_ROOT/state
-                                 and tar ARCHIVE_DIRS into \$DEVENV_ROOT/archives
-  restore                        reverse of snapshot — rsync stateful dirs
-                                 and extract archive tarballs into \$HOME
+  snapshot                       write a new versioned snapshot under
+                                 \$DEVENV_ROOT/snapshots (STATEFUL_DIRS +
+                                 ARCHIVE_DIRS + manifests), keeping the 3 newest
+  snapshots                      list retained snapshot versions (newest first)
+  restore [--rollback[=N]]       reverse of snapshot. Default restores the newest
+                                 version; --rollback restores the previous one,
+                                 --rollback=N goes back N versions.
   help                           this message
 
 Modules ship in: $DEVENV_MODULES
-Snapshots in:    $DEVENV_SNAPSHOT_DIR
+Snapshots in:    $DEVENV_SNAPSHOTS_DIR
 Archives in:     $DEVENV_ARCHIVES
 EOF
 }
@@ -114,6 +118,14 @@ cmd_doctor() {
     shopt -s nullglob dotglob
 
     local fails=0
+
+    # Snapshot-related checks read the current version dir (newest complete).
+    local _cur=""
+    _cur="$(_version_at 0 2>/dev/null || true)"
+    if [ -n "$_cur" ]; then
+        DEVENV_SNAPSHOT_DIR="$_cur"
+        DEVENV_ARCHIVES="$_cur"
+    fi
 
     step "symlinks"
     local entry rel src dst
@@ -191,8 +203,9 @@ cmd_doctor() {
     fi
 
     step "snapshot status"
-    if [ -f "$DEVENV_SNAPSHOT_DIR/snapshot.ts" ]; then
-        ok "snapshot: $(cat "$DEVENV_SNAPSHOT_DIR/snapshot.ts")"
+    if [ -n "$_cur" ]; then
+        local _created; _created="$(grep -o '"created"[^,]*' "$_cur/meta" 2>/dev/null | cut -d'"' -f4)"
+        ok "snapshot: version $(basename "$_cur") (${_created:-?}); $(_version_count) retained"
     else
         warn "no snapshot yet (run: devenv snapshot)"
     fi
@@ -281,6 +294,7 @@ _snapshot_entry() {
         rsync -a --no-links --delete --info=progress2 \
             --exclude='*.db-wal' --exclude='*.db-shm' --exclude='*.lock' \
             --exclude='*.wants/' \
+            --exclude='systemd/user/devenv-snapshot.service' \
             "$src/" "$dst/"
         ok "snapshot: ~/$name/"
     else
@@ -511,18 +525,32 @@ _restore_archive() {
 }
 
 cmd_snapshot() {
-    step "snapshot -> $DEVENV_SNAPSHOT_DIR"
-
     _ensure_rsync
+    mkdir -p "$DEVENV_SNAPSHOTS_DIR"
+    _migrate_legacy_snapshot
 
-    mkdir -p "$DEVENV_SNAPSHOT_DIR/home"
+    local ts; ts="${DEVENV_SNAPSHOT_TS:-$(date -u +%Y%m%d-%H%M%S)}"
+    local final="$DEVENV_SNAPSHOTS_DIR/$ts"
+    local partial="$final.partial"
+    if [ -e "$final" ]; then
+        warn "snapshot: version $ts already exists; skipping (try again in 1s)"
+        return 0
+    fi
+    rm -rf -- "$partial"
+    mkdir -p "$partial/home"
+
+    # Point the existing snapshot helpers at this version dir. DEVENV_STATE
+    # (sentinels) is defined independently in lib.sh and is NOT affected.
+    DEVENV_SNAPSHOT_DIR="$partial"
+    DEVENV_ARCHIVES="$partial"
+
+    step "snapshot -> $partial"
 
     local name
     for name in "${STATEFUL_DIRS[@]}"; do
         _snapshot_entry "$name"
     done
 
-    mkdir -p "$DEVENV_ARCHIVES"
     for name in "${ARCHIVE_DIRS[@]}"; do
         _snapshot_archive "$name"
     done
@@ -535,21 +563,23 @@ cmd_snapshot() {
     _snapshot_claude_json
 
     if have dpkg; then
-        dpkg --get-selections >"$DEVENV_SNAPSHOT_DIR/dpkg-selections.txt"
-        ok "wrote dpkg-selections.txt ($(wc -l <"$DEVENV_SNAPSHOT_DIR/dpkg-selections.txt") lines)"
+        dpkg --get-selections >"$partial/dpkg-selections.txt"
+        ok "wrote dpkg-selections.txt ($(wc -l <"$partial/dpkg-selections.txt") lines)"
     else
         warn "dpkg not available; skipping dpkg-selections.txt"
     fi
-
     if have apt-mark; then
-        apt-mark showmanual >"$DEVENV_SNAPSHOT_DIR/apt-manual.txt"
-        ok "wrote apt-manual.txt ($(wc -l <"$DEVENV_SNAPSHOT_DIR/apt-manual.txt") lines)"
+        apt-mark showmanual >"$partial/apt-manual.txt"
+        ok "wrote apt-manual.txt ($(wc -l <"$partial/apt-manual.txt") lines)"
     else
         warn "apt-mark not available; skipping apt-manual.txt"
     fi
 
-    date -Iseconds >"$DEVENV_SNAPSHOT_DIR/snapshot.ts"
-    ok "snapshot complete: $(cat "$DEVENV_SNAPSHOT_DIR/snapshot.ts")"
+    # meta LAST = completion marker, then promote partial -> final.
+    _write_meta "$partial"
+    mv -- "$partial" "$final"
+    _prune_versions
+    ok "snapshot complete: version $ts ($(_version_count) retained)"
 }
 
 # Copy a single entry from the snapshot tree back into $HOME.
@@ -583,9 +613,34 @@ _restore_entry() {
 }
 
 cmd_restore() {
-    step "restore <- $DEVENV_SNAPSHOT_DIR (+ archives)"
+    local rollback=0
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --rollback)    rollback=1 ;;
+            --rollback=*)  rollback="${1#*=}" ;;
+            *)             warn "restore: ignoring unknown arg: $1" ;;
+        esac
+        shift
+    done
 
     _ensure_rsync
+
+    # Resolve which version to read. Versioned store wins; fall back to the
+    # legacy single-copy state/ + archives/ when no versions exist yet.
+    if [ -n "$(_list_versions)" ]; then
+        local src
+        if ! src="$(_version_at "$rollback")"; then
+            die "restore: --rollback=$rollback out of range — only $(_version_count) version(s) available (see: devenv snapshots)"
+        fi
+        DEVENV_SNAPSHOT_DIR="$src"
+        DEVENV_ARCHIVES="$src"
+        log "restoring from version: $(basename "$src")$([ "$rollback" != 0 ] && printf ' (rolled back %s)' "$rollback")"
+    else
+        [ "$rollback" = 0 ] || die "restore: no versioned snapshots yet; --rollback unavailable"
+        log "no versioned snapshots; restoring from legacy state/ + archives/"
+    fi
+
+    step "restore <- $DEVENV_SNAPSHOT_DIR (+ archives)"
 
     if [ -f "$DEVENV_SNAPSHOT_DIR/snapshot.ts" ]; then
         log "snapshot taken: $(cat "$DEVENV_SNAPSHOT_DIR/snapshot.ts")"
@@ -645,6 +700,22 @@ cmd_restore() {
         log "no snapshot/archive data for: ${skipped[*]}"
     fi
 }
+cmd_snapshots() {
+    if [ -z "$(_list_versions)" ]; then
+        warn "no versioned snapshots yet (run: devenv snapshot)"
+        return 0
+    fi
+    printf '%-3s  %-17s  %-7s  %-25s  %s\n' "#" VERSION SIZE CREATED ""
+    local i=0 line ts size created marker
+    while IFS= read -r line; do
+        ts="$(basename "$line")"
+        size="$(du -sh "$line" 2>/dev/null | cut -f1)"
+        created="$(grep -o '"created"[^,]*' "$line/meta" 2>/dev/null | cut -d'"' -f4)"
+        if [ "$i" = 0 ]; then marker="<- current (devenv restore)"; else marker="devenv restore --rollback=$i"; fi
+        printf '%-3s  %-17s  %-7s  %-25s  %s\n' "$i" "$ts" "${size:-?}" "${created:-?}" "$marker"
+        i=$((i+1))
+    done < <(_list_versions)
+}
 
 case "$cmd" in
     help|-h|--help) cmd_help ;;
@@ -654,6 +725,7 @@ case "$cmd" in
     doctor)         cmd_doctor ;;
     sync)           cmd_sync ;;
     snapshot)       cmd_snapshot ;;
-    restore)        cmd_restore ;;
+    snapshots)      cmd_snapshots ;;
+    restore)        cmd_restore "$@" ;;
     *) err "unknown command: $cmd"; cmd_help; exit 2 ;;
 esac

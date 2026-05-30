@@ -20,6 +20,14 @@ DEVENV_STATE="$DEVENV_ROOT/archives/state"
 DEVENV_SNAPSHOT_DIR="$DEVENV_ROOT/state"
 export DEVENV_ROOT DEVENV_BIN DEVENV_HOME DEVENV_MODULES DEVENV_STATE DEVENV_SNAPSHOT_DIR
 
+# Versioned snapshot store. Each version is one complete dir under here named
+# by a sortable UTC timestamp; the newest is "current". A `meta` file written
+# LAST marks a version complete (the shared mount has no atomic rename, so we
+# rely on meta-presence rather than rename atomicity).
+DEVENV_SNAPSHOTS_DIR="$DEVENV_ROOT/snapshots"
+DEVENV_RETAIN="${DEVENV_RETAIN:-3}"
+export DEVENV_SNAPSHOTS_DIR DEVENV_RETAIN
+
 # What gets symlinked from $DEVENV_HOME into $HOME by init.sh.
 # Read-mostly dotfiles ONLY — these tolerate the virtio-fs / sdcardfs quirks
 # (no POSIX locking, no atomic rename) on /mnt/shared.
@@ -96,6 +104,91 @@ step()  { printf '\n%s==>%s %s%s%s\n' "$C_BLU" "$C_RESET" "$C_BOLD" "$*" "$C_RES
 die() { err "$*"; exit 1; }
 
 have() { command -v "$1" >/dev/null 2>&1; }
+
+# --- versioned snapshot store mechanics -----------------------------------
+
+# Echo complete version dirs (those containing a `meta`), newest first.
+_list_versions() {
+    local d out=() _ng; _ng="$(shopt -p nullglob)" || true
+    shopt -s nullglob
+    for d in "$DEVENV_SNAPSHOTS_DIR"/*/; do
+        d="${d%/}"
+        case "$d" in *.partial) continue ;; esac
+        [ -f "$d/meta" ] || continue
+        out+=("$d")
+    done
+    eval "$_ng"
+    [ ${#out[@]} -gt 0 ] || return 0
+    printf '%s\n' "${out[@]}" | sort -r
+}
+
+# Number of complete versions.
+_version_count() { _list_versions | wc -l; }
+
+# Echo the Nth-newest complete version dir (0 = newest). Return 1 if out of range.
+_version_at() {
+    local n="$1" i=0 line
+    while IFS= read -r line; do
+        if [ "$i" -eq "$n" ]; then printf '%s\n' "$line"; return 0; fi
+        i=$((i+1))
+    done < <(_list_versions)
+    return 1
+}
+
+# Write the completion marker. Called LAST when building a version.
+_write_meta() {
+    local dir="$1"
+    cat > "$dir/meta" <<EOF
+{
+  "schema": 1,
+  "created": "$(date -Iseconds)",
+  "created_after_successful_boot": true,
+  "devenv_root": "$DEVENV_ROOT"
+}
+EOF
+}
+
+# Remove *.partial leftovers and meta-less dirs, then keep only the newest
+# DEVENV_RETAIN versions.
+_prune_versions() {
+    local d _ng; _ng="$(shopt -p nullglob)" || true
+    shopt -s nullglob
+    for d in "$DEVENV_SNAPSHOTS_DIR"/*.partial; do
+        [ -e "$d" ] && rm -rf -- "$d"
+    done
+    for d in "$DEVENV_SNAPSHOTS_DIR"/*/; do
+        d="${d%/}"
+        case "$d" in *.partial) continue ;; esac
+        [ -f "$d/meta" ] || rm -rf -- "$d"
+    done
+    eval "$_ng"
+    local i=0 line
+    while IFS= read -r line; do
+        i=$((i+1))
+        [ "$i" -gt "$DEVENV_RETAIN" ] && rm -rf -- "$line"
+    done < <(_list_versions)
+}
+
+# One-time migration: if there are no complete versions yet but a legacy
+# single-copy snapshot exists (state/snapshot.ts), fold it into version 1 so the
+# existing good snapshot is not lost. Moves (renames) within the same mount —
+# never copies. Leaves archives/state/ (sentinels) in place.
+_migrate_legacy_snapshot() {
+    [ -n "$(_list_versions)" ] && return 0
+    local legacy_ts="$DEVENV_ROOT/state/snapshot.ts"
+    [ -f "$legacy_ts" ] || return 0
+    local ts
+    ts="$(date -u -d "$(cat "$legacy_ts")" +%Y%m%d-%H%M%S 2>/dev/null || date -u +%Y%m%d-%H%M%S)"
+    local dir="$DEVENV_SNAPSHOTS_DIR/$ts"
+    mkdir -p "$dir"
+    [ -d "$DEVENV_ROOT/state/home" ]                && mv -- "$DEVENV_ROOT/state/home"                "$dir/home"
+    [ -d "$DEVENV_ROOT/state/files" ]               && mv -- "$DEVENV_ROOT/state/files"               "$dir/files"
+    [ -f "$DEVENV_ROOT/state/dpkg-selections.txt" ] && mv -- "$DEVENV_ROOT/state/dpkg-selections.txt" "$dir/dpkg-selections.txt"
+    [ -f "$DEVENV_ROOT/state/apt-manual.txt" ]      && mv -- "$DEVENV_ROOT/state/apt-manual.txt"      "$dir/apt-manual.txt"
+    [ -f "$DEVENV_ARCHIVES/ssh.tar.gz" ]            && mv -- "$DEVENV_ARCHIVES/ssh.tar.gz"            "$dir/ssh.tar.gz"
+    _write_meta "$dir"
+    log "migrated legacy snapshot -> snapshots/$ts"
+}
 
 # Run a command with sudo only if we're not already root.
 maybe_sudo() {

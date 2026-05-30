@@ -64,32 +64,20 @@ if [ ! -L "$HOME/.local/bin/devenv" ] || [ "$(readlink "$HOME/.local/bin/devenv"
     ok "linked ~/.local/bin/devenv -> $DEVENV_BIN/devenv"
 fi
 
-# Install the systemd --user unit that snapshots on shutdown.
+# Retire the shutdown snapshot unit. Snapshots are now taken on successful boot
+# (bootstrap step 4), so the old ExecStop-on-shutdown unit is removed: it
+# captured arbitrary, possibly-broken state and would push good versions out of
+# the retained window.
 unit_name="devenv-snapshot.service"
-unit_src="$DEVENV_HOME/.config/systemd/user/$unit_name"
-unit_dst_dir="$HOME/.config/systemd/user"
-unit_dst="$unit_dst_dir/$unit_name"
-
-if [ -f "$unit_src" ]; then
-    mkdir -p "$unit_dst_dir"
-    if ! cmp -s "$unit_src" "$unit_dst" 2>/dev/null; then
-        cp -- "$unit_src" "$unit_dst"
-        ok "installed $unit_name -> $unit_dst"
+unit_dst="$HOME/.config/systemd/user/$unit_name"
+if have systemctl && systemctl --user --version >/dev/null 2>&1; then
+    if systemctl --user is-enabled --quiet "$unit_name" 2>/dev/null; then
+        systemctl --user disable "$unit_name" >/dev/null 2>&1 && ok "disabled legacy $unit_name" || true
     fi
-
-    if have systemctl && systemctl --user --version >/dev/null 2>&1; then
-        if systemctl --user is-enabled --quiet "$unit_name" 2>/dev/null; then
-            ok "$unit_name already enabled"
-        elif systemctl --user enable "$unit_name" >/dev/null 2>&1; then
-            ok "enabled $unit_name"
-        else
-            warn "could not enable $unit_name (systemctl --user not usable in this VM)"
-        fi
-    else
-        warn "systemctl --user unavailable — skipping enable of $unit_name"
-    fi
-else
-    warn "systemd unit source missing: $unit_src"
+fi
+if [ -f "$unit_dst" ]; then
+    rm -f -- "$unit_dst"
+    ok "removed legacy $unit_name"
 fi
 
 ok "init complete. Start a new shell or run: source ~/.bashrc"

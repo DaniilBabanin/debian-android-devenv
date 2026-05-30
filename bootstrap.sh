@@ -18,6 +18,8 @@
 #   bash /mnt/shared/debian-env/bootstrap.sh --all          # every module
 #   bash /mnt/shared/debian-env/bootstrap.sh --init-only    # only step 1
 #   bash /mnt/shared/debian-env/bootstrap.sh --no-snapshot  # skip step 4
+#   bash /mnt/shared/debian-env/bootstrap.sh --rollback     # restore previous snapshot version
+#   bash /mnt/shared/debian-env/bootstrap.sh --rollback=2   # restore 2 versions back
 #   bash /mnt/shared/debian-env/bootstrap.sh base claude    # explicit module list
 #                                                           # (still runs init,
 #                                                           #  restore, snapshot)
@@ -37,6 +39,7 @@ with_node=0
 with_python=0
 do_snapshot=1
 explicit_modules=()
+restore_args=()
 
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -45,6 +48,8 @@ while [ $# -gt 0 ]; do
         --with-node)    with_node=1 ;;
         --with-python)  with_python=1 ;;
         --no-snapshot)  do_snapshot=0 ;;
+        --rollback)     restore_args+=(--rollback) ;;
+        --rollback=*)   restore_args+=("$1") ;;
         -h|--help)      usage; exit 0 ;;
         --*)            err "unknown flag: $1"; usage; exit 2 ;;
         *)              explicit_modules+=("$1"); mode="explicit" ;;
@@ -103,7 +108,7 @@ if [ "$has_state" = 0 ]; then
     unset __rel
 fi
 if [ "$has_state" = 1 ]; then
-    devenv restore
+    devenv restore "${restore_args[@]}"
 else
     log "no snapshot or archive at $DEVENV_ROOT — skipping restore (first-run case)"
 fi
