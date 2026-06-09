@@ -1,0 +1,13 @@
+#!/data/data/com.termux/files/usr/bin/bash
+# Termux:Widget shortcut — start local code-server (detached tmux session),
+# then open http://localhost:8080 in the browser / PWA.
+termux-wake-lock 2>/dev/null
+if tmux has-session -t code-local 2>/dev/null; then
+    echo "code-local already running -> http://localhost:8080"
+else
+    tmux new-session -d -s code-local \
+        "proot-distro login debian --bind /storage/emulated/0:/mnt/shared -- bash -lic code-local"
+    echo "code-local started -> http://localhost:8080"
+    sleep 3   # give code-server a moment to listen before the browser hits it
+fi
+termux-open-url http://localhost:8080 2>/dev/null || true

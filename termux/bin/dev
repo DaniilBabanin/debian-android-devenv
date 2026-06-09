@@ -1,0 +1,220 @@
+#!/data/data/com.termux/files/usr/bin/bash
+# dev — tmux-managed proot guest workspace: named, auto-tiled panes in one view.
+#
+# Source of truth: <repo>/termux/bin/dev. termux/bootstrap.sh copies it to
+# $PREFIX/bin/dev (copy, not symlink — /sdcard has no exec bit). Edit the repo
+# copy, re-run termux/bootstrap.sh (or `install -m 0755 <repo>/termux/bin/dev
+# $PREFIX/bin/dev`) to update.
+#
+# Layout choices:
+#   - tmux server runs Termux-side (native): survives guest exits, pays no
+#     ptrace tax, reattaches after an app-UI kill (`dev` again).
+#   - one session = one split-screen view. Names address PANES (by pane
+#     title): `dev a b c` ensures a tiled pane per name, all visible at once.
+#     The session's default-command is a guest login, so every split lands in
+#     the guest; hooks re-tile on every split and pane exit (auto-arrange).
+#   - the bind makes the repo appear at /mnt/shared/... exactly like the VM.
+#     Keep in sync with PD_BIND in termux/bootstrap.sh.
+
+set -eu
+
+usage() {
+    cat <<'EOF'
+dev — proot guest workspace: named, auto-tiled panes in one tmux view
+
+  dev                   enter the workspace (split-screen by default:
+                        DEV_PANES guest panes, 2 if unset)
+  dev NAME [NAME...]    ensure a guest pane per NAME (matched by pane title,
+                        created if missing), focus the first — all visible
+                        at once. The NAME-set IS the session ('dev a b' -> view
+                        'a-b'), so a different set in another Termux tab is an
+                        independent view, and re-running the same set
+                        reattaches it. Layout follows pane count: 2 = side-by-
+                        side halves, 3 = first full left half + two stacked
+                        right, 4+ = equal grid. A single NAME zooms that pane
+                        full-screen so leftover panes from a previous session
+                        don't clutter the view (they stay alive; Ctrl-b z to
+                        unzoom and see them)
+  dev -s SESSION ...    force a specific session name (overrides the
+                        name-derived one); bare 'dev' uses session 'dev'
+  dev -p N              grow the view to N panes (overrides DEV_PANES;
+                        grow-only, never kills panes)
+  dev -c CMD [ARGS...]  one-off command inside the guest, no tmux: login
+                        shell, aliases available (dev -c devenv doctor,
+                        dev -c claudea), exit code propagates
+  dev -l                list sessions and their panes
+  dev -h                this help
+
+keys: tap a pane to focus it (mouse on), Ctrl-b z zoom/unzoom one pane (THE
+phone gesture), Ctrl-b arrows move, Ctrl-b % / " extra splits (auto-login +
+auto-tile), Ctrl-b d detach. Soft keyboard: taps go to tmux, so reopen it
+with the KEYBOARD extra key or the left-edge-drawer KEYBOARD button.
+scroll: PgUp enters copy-mode + pages up (PgUp/PgDn page, PgDn at bottom
+exits); full-screen apps (Claude Code, less, vim) get raw PgUp. Selecting
+text: a plain finger-drag selects WITHIN the active pane (tmux copy-mode).
+Termux's long-press selection ignores panes (spans the whole screen) — zoom
+the pane first (Ctrl-b z) if you need it.
+EOF
+}
+
+login=(proot-distro login debian --bind /storage/emulated/0:/mnt/shared)
+
+wake() { termux-wake-lock 2>/dev/null || true; }
+
+valid_name() {
+    case "$1" in *[!A-Za-z0-9_-]*|'') return 1 ;; *) return 0 ;; esac
+}
+
+session=dev
+session_explicit=0   # set by -s; suppresses name-derived session
+panes=""        # explicit -p request; empty = default behavior
+names=()
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+        -h|--help)
+            usage; exit 0 ;;
+        -l|--list)
+            tmux list-sessions 2>/dev/null || { echo "no sessions"; exit 0; }
+            tmux list-panes -a -F '  #{session_name}: pane #{pane_index} [#{pane_title}]'
+            exit 0 ;;
+        -s)
+            shift; session="${1:-}"; session_explicit=1
+            valid_name "$session" || { echo "dev: -s needs a session name" >&2; exit 2; } ;;
+        -p)
+            shift
+            case "${1:-}" in ''|*[!0-9]*) echo "dev: -p needs a pane count" >&2; exit 2 ;; esac
+            panes="$1" ;;
+        -c)
+            shift
+            [ $# -gt 0 ] || { usage >&2; exit 2; }
+            # One-off in a guest login shell: -l pulls in .profile (PATH incl.
+            # ~/.local/bin), -i makes .bashrc define the claude/claudea aliases.
+            wake
+            cmd="$(printf '%q ' "$@")"
+            exec "${login[@]}" -- bash -lic "$cmd" ;;
+        -*)
+            echo "dev: unknown flag: $1" >&2; usage >&2; exit 2 ;;
+        *)
+            valid_name "$1" || { printf 'dev: bad pane name: %q\n' "$1" >&2; exit 2; }
+            names+=("$1") ;;
+    esac
+    shift
+done
+
+# Auto-derive the session from the name-set so each set is its own view, and
+# separate Termux tabs (`dev a b` vs `dev 1 2`) don't mirror the one shared
+# session. Re-running the same names reattaches the same view. Explicit -s
+# wins; bare `dev` and `-p` keep the default 'dev' session. Subshell isolates
+# the IFS change; names are already restricted to [A-Za-z0-9_-], so the joined
+# value is a valid tmux session name.
+if [ "$session_explicit" = 0 ] && [ ${#names[@]} -gt 0 ]; then
+    session="$(IFS=-; printf '%s' "${names[*]}")"
+fi
+
+wake
+
+# ---- ensure the session exists and is configured ------------------------------
+# Targets use the bare session name: tmux resolves exact names first, and the
+# '=' exact-match prefix is NOT accepted by set-option/set-hook on Termux's
+# tmux 3.6b ("no such session: =dev") even though has-session tolerates it.
+# Options/hooks are (re)applied to pre-existing sessions too, so sessions made
+# by older versions pick up the behavior.
+session_created=0
+if ! tmux has-session -t "$session" 2>/dev/null; then
+    tmux new-session -d -s "$session" "${login[*]}"
+    session_created=1
+fi
+# New windows and splits log into the guest instead of a Termux shell...
+tmux set-option -t "$session" default-command "${login[*]}"
+# ...the window re-tiles itself whenever a pane appears or dies. Layout is
+# pane-count-aware: 2 = side-by-side halves, 3 = first pane full left half +
+# two stacked right (main-vertical), else equal grid (tiled). At hook time
+# window_panes already reflects the new count for all three hooks (pane-exited
+# fires after removal; kill-pane never fires pane-exited, hence the
+# after-kill-pane hook too)...
+retile="if-shell -F '#{==:#{window_panes},2}' 'select-layout even-horizontal' \"if-shell -F '#{==:#{window_panes},3}' 'select-layout main-vertical' 'select-layout tiled'\""
+tmux set-hook -t "$session" after-split-window "$retile"
+tmux set-hook -t "$session" pane-exited "$retile"
+tmux set-hook -t "$session" after-kill-pane "$retile"
+tmux set-option -w -t "$session" main-pane-width '50%'
+# ...pane titles (the names) are visible on the borders and apps can't clobber
+# them via OSC title escapes (Claude Code sets the terminal title; without this
+# a re-run sees the name "missing" and splits a duplicate pane)...
+tmux set-option -t "$session" pane-border-status top
+tmux set-option -w -t "$session" allow-set-title off
+# ...and taps focus panes (Termux sends taps as mouse clicks when mouse mode is
+# on; reopen the soft keyboard with the KEYBOARD extra key or the
+# left-edge-drawer KEYBOARD button, not by tapping).
+tmux set-option -t "$session" mouse on
+# tmux replaces the terminal's own scrollback, so a bare PageUp would fall
+# through to the app (a shell prompt ignores it) and the PGUP extra key stops
+# scrolling. Bind PageUp to enter copy-mode and page up — but only on the
+# normal screen: full-screen apps on the alternate screen (Claude Code, less,
+# vim) get the real PageUp. Inside copy-mode the native keys page up/down and
+# -e exits at the bottom. bind-key is server-global; re-applying is harmless.
+tmux bind-key -n PPage if-shell -F '#{alternate_on}' 'send-keys PPage' 'copy-mode -eu'
+
+# ---- named panes ----------------------------------------------------------------
+# split-window targeting the session hits the ACTIVE pane and inserts the new
+# pane right after it — repeated splits come out in reverse visual order
+# (a, c, b). Splitting the last pane appends instead, keeping argument order.
+last_pane() { tmux list-panes -t "$session" -F '#{pane_id}' | tail -1; }
+
+if [ ${#names[@]} -gt 0 ]; then
+    # A freshly created session has one untitled pane — claim it for the first
+    # name instead of splitting.
+    if [ "$session_created" = 1 ]; then
+        tmux select-pane -t "$session" -T "${names[0]}"
+    fi
+    for n in "${names[@]}"; do
+        if ! tmux list-panes -t "$session" -F '#{pane_title}' | grep -qxF "$n"; then
+            id="$(tmux split-window -d -P -F '#{pane_id}' -t "$(last_pane)")"
+            tmux select-pane -t "$id" -T "$n"
+        fi
+    done
+fi
+
+# ---- pane count -------------------------------------------------------------------
+# Bare `dev` defaults to a DEV_PANES-way split (2 if unset); with names the
+# names dictate the panes unless -p asks for more. Grow-only.
+target="$panes"
+if [ -z "$target" ] && [ ${#names[@]} -eq 0 ]; then
+    target="${DEV_PANES:-2}"
+    case "$target" in *[!0-9]*|'') echo "dev: DEV_PANES must be a number (got: $target)" >&2; exit 2 ;; esac
+fi
+if [ -n "$target" ]; then
+    while [ "$(tmux list-panes -t "$session" | wc -l)" -lt "$target" ]; do
+        tmux split-window -d -t "$(last_pane)"
+    done
+fi
+# Same count-aware layout as the hooks, for panes that already existed.
+case "$(tmux list-panes -t "$session" | wc -l)" in
+    2) tmux select-layout -t "$session" even-horizontal ;;
+    3) tmux select-layout -t "$session" main-vertical ;;
+    *) tmux select-layout -t "$session" tiled ;;
+esac
+
+# ---- enter -------------------------------------------------------------------------
+# Focus the first named pane, then attach (or switch, when already inside tmux).
+if [ ${#names[@]} -gt 0 ]; then
+    pid="$(tmux list-panes -t "$session" -F '#{pane_id} #{pane_title}' \
+        | awk -v t="${names[0]}" '$2==t{print $1; exit}')"
+    if [ -n "$pid" ]; then
+        tmux select-window -t "$pid"
+        tmux select-pane -t "$pid"
+        # A single name collapses the view to just that pane: zoom it so any
+        # leftover panes from a previous session don't show as extra tiles.
+        # Non-destructive — the others stay alive (Ctrl-b z to unzoom). The
+        # select-layout above already cleared any stale zoom, so multiple
+        # names keep their tiled view. Skip when there's only one pane total
+        # (nothing to hide; -Z would needlessly toggle the zoom flag).
+        if [ ${#names[@]} -eq 1 ] && [ "$(tmux list-panes -t "$session" | wc -l)" -gt 1 ]; then
+            tmux resize-pane -Z -t "$pid"
+        fi
+    fi
+fi
+if [ -n "${TMUX:-}" ]; then
+    exec tmux switch-client -t "$session"
+fi
+exec tmux attach-session -t "$session"

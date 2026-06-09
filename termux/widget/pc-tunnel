@@ -1,0 +1,13 @@
+#!/data/data/com.termux/files/usr/bin/bash
+# Termux:Widget shortcut — start the autossh forward to the PC's VS Code
+# serve-web (detached tmux session), then open http://localhost:8001.
+termux-wake-lock 2>/dev/null
+if tmux has-session -t pc-tunnel 2>/dev/null; then
+    echo "pc-tunnel already running -> http://localhost:8001"
+else
+    tmux new-session -d -s pc-tunnel \
+        "proot-distro login debian --bind /storage/emulated/0:/mnt/shared -- bash -lic pc-tunnel"
+    echo "pc-tunnel started -> http://localhost:8001"
+    sleep 5   # cloudflared + ssh need a few seconds; refresh browser if early
+fi
+termux-open-url http://localhost:8001 2>/dev/null || true

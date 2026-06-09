@@ -1,0 +1,7 @@
+#!/data/data/com.termux/files/usr/bin/bash
+# Termux:Widget shortcut — one-tap Claude Code in its own tmux session.
+# -A attaches if the session already exists, so re-tapping resumes it.
+# Termux-side tmux server (same design as `dev`): survives guest exits.
+termux-wake-lock 2>/dev/null
+exec tmux new-session -A -s claude \
+    "proot-distro login debian --bind /storage/emulated/0:/mnt/shared -- bash -lic claudea"

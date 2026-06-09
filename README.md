@@ -6,14 +6,14 @@ host-side mount that outlives the VM. My setup lives at
 `/mnt/shared/debian-env/`. The scripts resolve their own root, so stage
 this anywhere persistent and the same commands work.
 
-## Why this exists
+## Runtimes
 
-Android 16 ships a Linux Terminal app (`com.android.virtualization.terminal`) that runs Debian inside a crosvm-backed VM via the Android Virtualization Framework. It's marked experimental, the VM disk lives in app-private storage you can't reach without root, and a few common failure modes leave you reinstalling from scratch:
+Two ways to run this:
 
-- **Ungraceful shutdown poisons next boot.** Swiping the app away, OOM kills, or the Android low-memory killer reaping the VM leaves the disk in a state where the next launch hits a `RejectedExecutionException` in the app's logger, or crash-loops with a system reset within ~2 seconds of boot. Recovery is the developer-options toggle (Settings → Developer options → Linux development environment → off and on), which wipes the disk.
-- **Half-written state on the shared mount cascades.** `/mnt/shared` is bridged through virtio-fs to Android's MediaProvider-backed storage. POSIX file locking and atomic rename semantics are unreliable there, so any tool that puts SQLite, lockfiles, or write-tmp-then-rename state on it can leave behind corrupt files that take down the next launch.
+- **AVF VM** — Android's Linux Terminal app (`com.android.virtualization.terminal`). The original target; everything below assumes it.
+- **Termux + proot Debian** — runs the *same* core inside a proot-distro Debian under [Termux](https://github.com/termux/termux-app), plus a thin Android-side shim (proot setup, phantom-process-killer mitigation, a tmux pane launcher). See [`termux/README.md`](termux/README.md).
 
-This repo assumes the wipes will keep happening and makes recovery cheap. It stores a portable, idempotent description of the dev environment on Android shared storage (`/storage/emulated/0` → `/mnt/shared` inside the VM) and rebuilds a fresh Debian install to a working state in one command. The snapshot/restore split exists because of the virtio-fs limits above: stateful directories live on the VM's ext4, not on `/mnt/shared`. Only tar-packed archives, which bake permissions into metadata, round-trip safely through the shared mount.
+`modules/` is the single source of truth for what gets installed, and both runtimes consume it — the Termux shim just calls `bootstrap.sh` inside the guest. Add install logic once, in `modules/`; never fork it per runtime.
 
 ## Install
 
@@ -160,6 +160,15 @@ Plugins and skills aren't persisted directly — they're reinstalled from manife
 - Skill: append `<git-url> [name]` to `modules/claude-skills.txt` (cloned shallow into `~/.claude/skills/<name>`).
 
 `devenv install claude-plugins` (re)runs the install. Idempotent — already-installed entries are skipped, so it's safe to re-run after editing the manifests.
+
+## Why this exists
+
+Android 16 ships a Linux Terminal app (`com.android.virtualization.terminal`) that runs Debian inside a crosvm-backed VM via the Android Virtualization Framework. It's marked experimental, the VM disk lives in app-private storage you can't reach without root, and a few common failure modes leave you reinstalling from scratch:
+
+- **Ungraceful shutdown poisons next boot.** Swiping the app away, OOM kills, or the Android low-memory killer reaping the VM leaves the disk in a state where the next launch hits a `RejectedExecutionException` in the app's logger, or crash-loops with a system reset within ~2 seconds of boot. Recovery is the developer-options toggle (Settings → Developer options → Linux development environment → off and on), which wipes the disk.
+- **Half-written state on the shared mount cascades.** `/mnt/shared` is bridged through virtio-fs to Android's MediaProvider-backed storage. POSIX file locking and atomic rename semantics are unreliable there, so any tool that puts SQLite, lockfiles, or write-tmp-then-rename state on it can leave behind corrupt files that take down the next launch.
+
+This repo assumes the wipes will keep happening and makes recovery cheap. It stores a portable, idempotent description of the dev environment on Android shared storage (`/storage/emulated/0` → `/mnt/shared` inside the VM) and rebuilds a fresh Debian install to a working state in one command. The snapshot/restore split exists because of the virtio-fs limits above: stateful directories live on the VM's ext4, not on `/mnt/shared`. Only tar-packed archives, which bake permissions into metadata, round-trip safely through the shared mount.
 
 ## Risks and known limits
 

@@ -1,0 +1,3 @@
+#!/data/data/com.termux/files/usr/bin/bash
+# Termux:Widget shortcut — enter the dev workspace (tmux + proot guest panes).
+exec dev
