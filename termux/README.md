@@ -50,9 +50,11 @@ the official installer just works, and the apt-based devenv modules run as-is.
 
    ```bash
    dev                   # the workspace: split-screen by default (DEV_PANES, 2)
-   dev claude builds     # one view, a tiled guest pane per name, all visible
-   dev -p 3              # grow the view to 3 panes (grow-only)
-   dev -s other ...      # separate session/view (for a 2nd drawer terminal)
+   dev claude builds     # a tiled guest pane per name, all visible — and the
+                         #   name-set IS the session ('claude-builds')
+   dev claude            # single name zooms that pane full-screen
+   dev -p 3              # grow the view to 3 panes (grow-only, never kills)
+   dev -s other claude   # force session name 'other' (override the derived one)
    dev -c devenv doctor  # one-off inside the guest, no tmux (aliases work: dev -c claudea)
    dev -l                # list sessions + panes
    dev -h                # usage
@@ -60,11 +62,21 @@ the official installer just works, and the apt-based devenv modules run as-is.
 
    Inside: `claudea`, `devenv doctor`, `devenv install <mod>` — same as the
    VM. Names address panes by title (shown on pane borders), attach-or-create.
-   Extra splits via `Ctrl-b %` / `"` auto-login to the guest and the layout
-   re-tiles itself on every split/close. `Ctrl-b z` zooms one pane
-   full-screen (the key phone gesture), `Ctrl-b arrows` move, `Ctrl-b d`
-   detaches. A second Termux drawer terminal (swipe left edge → NEW SESSION)
-   can `dev -s other` for true side-by-side views.
+   **The NAME-set is the session**: `dev a b` → view `a-b`, so a different set
+   in another Termux tab is an independent view and re-running the same set
+   reattaches it (bare `dev` / `-p` use session `dev`; `-s` overrides). Layout
+   follows pane count: 2 = side-by-side halves, 3 = first pane full left half +
+   two stacked right, 4+ = equal grid. A single NAME zooms that pane so
+   leftovers from a previous session don't clutter (they stay alive; `Ctrl-b z`
+   to unzoom). Extra splits via `Ctrl-b %` / `"` auto-login to the guest and
+   re-tile on every split/close.
+
+   Keys: tap a pane to focus it (mouse on), `Ctrl-b z` zoom/unzoom one pane
+   (the phone gesture), `Ctrl-b arrows` move, `Ctrl-b d` detach. Soft keyboard
+   taps go to tmux, so reopen it with the KEYBOARD extra key. Scroll: `PgUp`
+   enters copy-mode and pages up; full-screen apps (Claude Code, less, vim) get
+   raw `PgUp`. A finger-drag selects within the active pane; Termux long-press
+   selection ignores panes (spans the screen) — zoom the pane first if needed.
 
 ## Persistence model (differs from the VM!)
 
