@@ -1,142 +1,96 @@
 # devenv on Termux (proot-distro Debian)
 
-The AVF terminal VM (`com.android.virtualization.terminal`) is unstable
-(community-confirmed: GrapheneOS tracker #5718/#6375/#5733 — phone-crashing
-installs, corrupt VM configs). This variant runs the **same devenv unchanged**
-inside proot-distro Debian on Termux instead.
+The AVF terminal VM is unstable (GrapheneOS tracker #5718 / #6375 / #5733 —
+phone-crashing installs, corrupt VM configs). This runs the **same devenv
+unchanged** inside proot-distro Debian on Termux.
 
-Why proot and not native Termux: Claude Code ships a glibc binary that
-segfaults on bionic, and the npm fallback is frozen at v2.1.112
-(anthropics/claude-code#50270, #20778). proot-distro Debian gives real glibc —
-the official installer just works, and the apt-based devenv modules run as-is.
-
-## Layers
+Why proot and not native Termux: Claude Code ships a glibc binary that segfaults
+on bionic, and the npm fallback is frozen at v2.1.112
+(anthropics/claude-code#50270). proot Debian gives real glibc — the official
+installer and the apt-based modules just work.
 
 | layer | runs | owns |
 |---|---|---|
-| Termux (bionic) | `termux/` scripts | wake-lock, tmux server, proot lifecycle, kill-mitigations |
-| proot Debian (glibc, trixie) | existing `bootstrap.sh` + modules | apt tools, dotfiles, Claude Code |
-| repo on shared storage | — | bound to `/mnt/shared` inside the guest → **paths identical to the VM** |
+| Termux (bionic) | `termux/` scripts | wake-lock, tmux server, proot lifecycle, kill-mitigation |
+| proot Debian (glibc, trixie) | core `bootstrap.sh` + modules | apt tools, dotfiles, Claude Code |
+| repo on shared storage | bound to `/mnt/shared` in the guest | **paths identical to the VM** |
 
 ## Setup
 
-1. Install **Termux from GitHub releases** (or F-Droid — never mix sources;
-   never the Play Store build): <https://github.com/termux/termux-app/releases>
-2. In Termux:
+Install Termux from [GitHub releases](https://github.com/termux/termux-app/releases)
+or F-Droid — never the Play Store build, never mix sources. Then:
 
-   ```bash
-   termux-setup-storage    # grant storage permission
-   bash ~/storage/shared/Sync/debian-env/termux/bootstrap.sh
-   ```
+```bash
+termux-setup-storage                                          # grant storage permission
+bash ~/storage/shared/Sync/debian-env/termux/bootstrap.sh     # ~20 min
+bash ~/storage/shared/Sync/debian-env/termux/mitigate.sh      # one-time, don't skip
+```
 
-   Installs Termux pkgs (proot-distro, tmux, termux-api, android-tools), the
-   Debian rootfs, then runs the regular devenv bootstrap inside it
-   (`--no-snapshot base claude cloudflared claude-plugins`). The restore step
-   seeds Claude credentials, `~/.ssh`, `.config`, and shell history from the
-   VM snapshots — Claude is logged in from first launch.
+- **bootstrap** installs Termux pkgs (proot-distro, tmux, termux-api, android-tools) + the Debian rootfs, then runs the core devenv bootstrap inside it (`--no-snapshot base claude cloudflared claude-plugins`). Restore seeds Claude creds, `~/.ssh`, `.config`, and history from the VM snapshots — logged in from first launch.
+- **mitigate** disables Android's phantom-process killer (>32 system-wide children → SIGKILL; a Claude session spawning compilers/git/tests is the worst case) via the device's own Wireless debugging — no PC needed, persists across reboots. Also prints the one-time Samsung battery checklist.
 
-3. One-time, do not skip:
+## Daily entry: `dev`
 
-   ```bash
-   bash ~/storage/shared/Sync/debian-env/termux/mitigate.sh
-   ```
+```bash
+dev                   # workspace: split-screen (DEV_PANES, default 2)
+dev claude builds     # a tiled guest pane per name — and the name-set IS the
+                      #   session ('claude-builds'), independent per Termux tab
+dev claude            # single name zooms that pane full-screen
+dev -p 3              # grow to N panes (grow-only, never kills)
+dev -s other claude   # force the session name (override the derived one)
+dev -c devenv doctor  # one-off in the guest, no tmux (aliases work: dev -c claudea)
+dev -l / dev -h       # list sessions / usage
+```
 
-   Disables Android's phantom-process killer (>32 child processes system-wide
-   → SIGKILL; a Claude session spawning compilers/git/tests is the worst case)
-   via the device's own Wireless debugging — no PC needed. Persists across
-   reboots. Also prints the Samsung battery checklist (manual, one-time).
+Inside it's `claudea`, `devenv doctor`, `devenv install <mod>` — same as the VM.
+Layout follows pane count: 2 = side-by-side halves, 3 = first pane full left +
+two stacked right, 4+ = grid. Extra `Ctrl-b %` / `"` splits auto-login to the
+guest and re-tile.
 
-4. Daily entry:
+Keys: tap a pane to focus (mouse on), `Ctrl-b z` zoom/unzoom one pane (the phone
+gesture), `Ctrl-b arrows` move, `Ctrl-b d` detach. Soft-keyboard taps go to
+tmux — reopen it with the KEYBOARD extra key. `PgUp` scrolls (enters copy-mode);
+full-screen apps (Claude Code, less, vim) get raw `PgUp`. A finger-drag selects
+within the active pane; Termux long-press selection ignores panes (spans the
+screen) — zoom the pane first if you need it.
 
-   ```bash
-   dev                   # the workspace: split-screen by default (DEV_PANES, 2)
-   dev claude builds     # a tiled guest pane per name, all visible — and the
-                         #   name-set IS the session ('claude-builds')
-   dev claude            # single name zooms that pane full-screen
-   dev -p 3              # grow the view to 3 panes (grow-only, never kills)
-   dev -s other claude   # force session name 'other' (override the derived one)
-   dev -c devenv doctor  # one-off inside the guest, no tmux (aliases work: dev -c claudea)
-   dev -l                # list sessions + panes
-   dev -h                # usage
-   ```
+## Persistence (differs from the VM)
 
-   Inside: `claudea`, `devenv doctor`, `devenv install <mod>` — same as the
-   VM. Names address panes by title (shown on pane borders), attach-or-create.
-   **The NAME-set is the session**: `dev a b` → view `a-b`, so a different set
-   in another Termux tab is an independent view and re-running the same set
-   reattaches it (bare `dev` / `-p` use session `dev`; `-s` overrides). Layout
-   follows pane count: 2 = side-by-side halves, 3 = first pane full left half +
-   two stacked right, 4+ = equal grid. A single NAME zooms that pane so
-   leftovers from a previous session don't clutter (they stay alive; `Ctrl-b z`
-   to unzoom). Extra splits via `Ctrl-b %` / `"` auto-login to the guest and
-   re-tile on every split/close.
+The rootfs + its `$HOME` live in Termux app data: they survive reboots and app
+updates, dying only on uninstall / data-clear. **No frequent rebuilds** — the
+guest *reads* VM snapshots (creds/ssh/config seeding) but never *writes* them
+(`--no-snapshot` is hard-coded), so the VM's retained-3 window stays pure.
+Disaster recovery = re-run `termux/bootstrap.sh`, restore re-seeds.
 
-   Keys: tap a pane to focus it (mouse on), `Ctrl-b z` zoom/unzoom one pane
-   (the phone gesture), `Ctrl-b arrows` move, `Ctrl-b d` detach. Soft keyboard
-   taps go to tmux, so reopen it with the KEYBOARD extra key. Scroll: `PgUp`
-   enters copy-mode and pages up; full-screen apps (Claude Code, less, vim) get
-   raw `PgUp`. A finger-drag selects within the active pane; Termux long-press
-   selection ignores panes (spans the screen) — zoom the pane first if needed.
-
-## Persistence model (differs from the VM!)
-
-- The rootfs + its `$HOME` live in Termux app data: they survive reboots and
-  app updates, and die only on app uninstall / data clear. **No frequent
-  rebuilds** — the snapshot machinery is consumed, not fed:
-  - guest restore **reads** VM snapshots (creds/ssh/config seeding);
-  - guest never **writes** snapshots (`--no-snapshot` hard-coded) — the
-    retained-3 window stays VM-pure.
-- Disaster recovery = re-run `termux/bootstrap.sh` (~20 min), restore re-seeds.
-- Caveat: VM and Termux seeded from the same OAuth refresh token — running
-  both regularly may force a re-login in one of them. This is a migration,
-  not a dual daily-driver.
-- Module sentinels in `archives/state/` are shared with the VM (cosmetic noise
-  in `devenv list`; harmless — modules self-detect installed state).
+Caveat: VM and Termux share one OAuth refresh token — running both regularly may
+force a re-login in one. This is a migration, not a dual daily-driver.
 
 ## Phone notifications from PC-side Claude
 
-When you ssh into the PC (`ssh pc` / `ssh ssh.babanin.de` from the guest) and
-Claude Code there blocks on input, the phone gets a Termux notification.
-Chain:
+When you `ssh pc` from the guest and Claude Code there blocks on input, the phone
+gets a Termux notification:
 
-    PC Notification hook (~/.local/bin/claude-phone-notify, repo copy at
-    bin/claude-phone-notify) -> 127.0.0.1:9876 on the PC
-    -> ssh RemoteForward (stanzas in ~/.ssh/config, regenerated by
-       install-cloudflared.sh) -> guest 127.0.0.1:9876
-    -> claude-notify-listen (socat, lazily started by ssh LocalCommand)
-    -> claude-notify -> termux-notification
+```
+PC Notification hook (bin/claude-phone-notify) → 127.0.0.1:9876
+  → ssh RemoteForward (stanzas from install-cloudflared.sh) → guest :9876
+  → claude-notify-listen (socat, lazy via ssh LocalCommand) → termux-notification
+```
 
-Only works while an ssh session to the PC is up (that's what carries the
-forward) — which is exactly when you'd be waiting on PC-side Claude. With two
-concurrent sessions the second one's RemoteForward fails with a warning
-(port busy on the PC); harmless, the first session keeps delivering.
+Works only while an ssh session to the PC is up — which is exactly when you'd be
+waiting on PC-side Claude. The PC isn't bootstrap-managed: on reinstall, copy
+`bin/claude-phone-notify` to PC `~/.local/bin/` (chmod 755) and register it as a
+Notification hook in the PC's `~/.claude/settings.json`.
 
-PC reinstall (the PC is not bootstrap-managed):
+## Limits / debugging
 
-1. copy `bin/claude-phone-notify` to PC `~/.local/bin/` (chmod 755)
-2. register on the PC: Notification hook `$HOME/.local/bin/claude-phone-notify`
-   in `~/.claude/settings.json` (same shape as install-claude.sh writes)
+- `watch` module (systemd) is skipped — no systemd under proot; `devenv probe` degrades gracefully.
+- File-heavy ops (apt, npm install, big greps) pay proot's ptrace tax — slower than the VM, in exchange for not crashing.
+- Random `[Process completed (signal 9)]` → mitigation regressed (an Android update can reset the flag); re-run `mitigate.sh --verify` and recheck the Samsung list.
+- `devenv` in the guest is an exec-wrapper (`/sdcard` has no exec bit, so the symlink `init.sh` creates can't run). A bare `devenv init` re-creates that broken symlink — re-run `termux/bootstrap.sh` to re-fix if `devenv` stops resolving.
 
-## Known limits / debugging
+## Validation (after first setup)
 
-- `watch` module (systemd) is skipped — no systemd under proot. `devenv probe`
-  degrades gracefully (some /proc reads are restricted in app context).
-- File-heavy ops (apt, npm install, big greps) pay proot's ptrace tax — slower
-  than the VM was, in exchange for not crashing.
-- Random `[Process completed (signal 9)]` → mitigation regressed (Android
-  update can reset the flag); re-run `mitigate.sh --verify` and re-check the
-  Samsung checklist.
-- `devenv` inside the guest is an exec-wrapper (`bash <repo>/bin/devenv`)
-  installed by `termux/bootstrap.sh` — the symlink `init.sh` creates points
-  onto `/sdcard`, which has no exec bit. A later bare `devenv init` re-creates
-  that symlink; if `devenv` then stops resolving on this device, re-run
-  `termux/bootstrap.sh` to re-fix.
-
-## Validation checklist (after first setup)
-
-1. `bash termux/bootstrap.sh` again → all steps skip/ok (idempotent)
-2. `mitigate.sh` → "already disabled"; Samsung list done
-3. `dev` → prompt + dotfiles correct; `devenv doctor` inside mostly green
-4. `claude --version`; logged in without onboarding; short session with tool use
-5. Stress: 30+ min Claude session with builds, screen off mid-way → no signal-9
-6. Reboot phone → `dev` → everything intact, no re-bootstrap
+Re-run `bootstrap.sh` (all steps skip/ok) and `mitigate.sh` ("already
+disabled"); `dev` → `devenv doctor` mostly green; `claude --version` logged in
+with no onboarding; a 30+ min Claude session with builds and screen off mid-way →
+no signal-9; reboot the phone → `dev` → everything intact, no re-bootstrap.
