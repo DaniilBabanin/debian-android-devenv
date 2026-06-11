@@ -1,9 +1,8 @@
-# Claude Code plugin marketplaces to register on each rebuild.
+# Claude Code plugin marketplaces to register.
 # Format: one source per line. <source> can be a GitHub `owner/repo`,
-# a URL, or a local path (see `claude plugin marketplace add --help`).
+# a URL, or a path (see `claude plugin marketplace add --help`).
 # Comments (#) and blank lines are ignored.
-#
-# The official Anthropic marketplace is added by default. Add others below
-# if you use plugins from third-party marketplaces.
 
 anthropics/claude-plugins-official
+multica-ai/andrej-karpathy-skills   # registers as marketplace "karpathy-skills"
+JuliusBrussee/caveman               # registers as marketplace "caveman"

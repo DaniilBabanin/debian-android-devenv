@@ -6,15 +6,18 @@
 #                  systemd --user unit, put `devenv` on PATH
 #   2. restore     copy ~/.claude, ~/.config, ~/.bash_history back from the
 #                  on-disk snapshot at $DEVENV_ROOT/state (skipped if none yet)
-#   3. install     run the essential modules: base + claude
+#   3. install     run the essential modules: base + claude + cloudflared
 #                  add --with-node and/or --with-python to opt in to those
 #   4. snapshot    refresh $DEVENV_ROOT/state from the live $HOME so the next
 #                  rebuild has fresh state (skip with --no-snapshot)
+#   5. probe       append a degradation-signal baseline for this boot to
+#                  metrics/probe.jsonl (best-effort; see docs/harden-spec.md)
 #
 # Usage:
 #   bash /mnt/shared/debian-env/bootstrap.sh                # essentials + snapshot
 #   bash /mnt/shared/debian-env/bootstrap.sh --with-node    # + node toolchain
 #   bash /mnt/shared/debian-env/bootstrap.sh --with-python  # + python toolchain
+#   bash /mnt/shared/debian-env/bootstrap.sh --with-cloudflared # no-op (cloudflared now default)
 #   bash /mnt/shared/debian-env/bootstrap.sh --all          # every module
 #   bash /mnt/shared/debian-env/bootstrap.sh --init-only    # only step 1
 #   bash /mnt/shared/debian-env/bootstrap.sh --no-snapshot  # skip step 4
@@ -47,6 +50,7 @@ while [ $# -gt 0 ]; do
         --all)          mode="all" ;;
         --with-node)    with_node=1 ;;
         --with-python)  with_python=1 ;;
+        --with-cloudflared) : ;;  # no-op: cloudflared is now in the default set
         --no-snapshot)  do_snapshot=0 ;;
         --rollback)     restore_args+=(--rollback) ;;
         --rollback=*)   restore_args+=("$1") ;;
@@ -124,11 +128,16 @@ case "$mode" in
         devenv install all
         ;;
     default)
-        mods=(base claude)
+        # cloudflared is in the default set (SSH access to ssh.babanin.de).
+        # --with-cloudflared is now a no-op kept for back-compat.
+        mods=(base claude cloudflared)
         [ "$with_node"   = 1 ] && mods+=(node)
         [ "$with_python" = 1 ] && mods+=(python)
         # claude-plugins must come after claude (uses the CLI it installs).
         mods+=(claude-plugins)
+        # watch: degradation episode logger (systemd --user). Needs jq (base)
+        # and the devenv symlink (init) — both present by now.
+        mods+=(watch)
         devenv install "${mods[@]}"
         ;;
 esac
@@ -140,6 +149,12 @@ if [ "$do_snapshot" = 1 ]; then
 else
     log "snapshot skipped (--no-snapshot)"
 fi
+
+# ---- step 5: probe baseline ----------------------------------------------
+# Append a degradation-signal sample tagged with this boot so metrics/probe.jsonl
+# accumulates a cross-rebuild trend automatically (see docs/harden-spec.md).
+# Read-only + append; best-effort, never fails the bootstrap.
+devenv probe --label boot-baseline >/dev/null 2>&1 || warn "probe baseline skipped"
 
 ok "bootstrap: done. Open a new shell or run: source ~/.bashrc"
 log "next VM rebuild: re-run \`bash $DEVENV_ROOT/bootstrap.sh\`"

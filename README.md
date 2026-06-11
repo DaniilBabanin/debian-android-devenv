@@ -1,126 +1,178 @@
 # devenv — persistent Debian dev environment
 
-Keeps dotfiles, credentials, and an install dispatcher on a host-side mount that
-outlives the VM, so a wiped Debian-on-Android install rebuilds to a working
-state in one command. Scripts resolve their own root — stage this anywhere
-persistent (my setup is at `/mnt/shared/debian-env/`).
+Survives full reinstalls of the Debian-on-Android emulator by keeping dotfiles and an install dispatcher on the Android-side shared mount (`/mnt/shared/debian-env/`).
 
-## Runtimes
+> **Termux variant:** the AVF terminal VM proved unstable, so the same devenv
+> also runs inside proot-distro Debian on Termux — see [`termux/README.md`](termux/README.md).
+> The shared-storage repo is bound to `/mnt/shared` in the guest, so everything
+> below applies unchanged; only the `termux/` shim is Termux-specific.
 
-- **AVF VM** — Android's Linux Terminal app (`com.android.virtualization.terminal`). The original target; everything below assumes it.
-- **Termux + proot Debian** — runs the *same* core inside proot-distro Debian under [Termux](https://github.com/termux/termux-app), plus a thin Android-side shim (proot setup, phantom-process-killer mitigation, a tmux pane launcher). See [`termux/README.md`](termux/README.md).
-
-`modules/` is the single source of truth for installs; both runtimes consume it
-(the Termux shim just calls `bootstrap.sh` in the guest). Add install logic
-once — never fork it per runtime.
-
-## Install
-
-Clone to a path that survives reinstalls (on Android, the shared mount):
+## After a fresh Debian install
 
 ```bash
-git clone https://github.com/<you>/debian-android-devenv.git /mnt/shared/debian-env
+bash /mnt/shared/debian-env/bootstrap.sh 
 ```
-
-Fill in `home/.gitconfig` (name/email), and optionally drop `~/.ssh` / `~/.gnupg`
-into `archives/` as `tar.gz` before the first bootstrap.
-
-## Bootstrap (after a fresh Debian install)
 
 ```bash
-bash /mnt/shared/debian-env/bootstrap.sh
+ulimit -s unlimited && CLAUDE_CODE_NO_FLICKER=1 CLAUDE_CODE_DISABLE_MOUSE=1 claude --permission-mode auto
 ```
 
-Symlinks dotfiles → restores state (`~/.config`, history, `~/.ssh`, Claude creds
-+ the auth subset of `~/.claude.json` so `claude` stays logged in) → puts
-`devenv` on PATH → runs the essential modules (`base claude cloudflared
-claude-plugins`) → snapshots the booted state (keeps 3 newest). Add
-`--with-node` / `--with-python` / `--all` for more modules, `--no-snapshot` to
-skip the final snapshot. Then open a new shell.
+```bash
+ulimit -s unlimited &&
+CLAUDE_CODE_NO_FLICKER=1 CLAUDE_CODE_DISABLE_MOUSE=1 claude
+```
+
+```bash
+port CLAUDE_CODE_SUBAGENT_MODEL="claude-opus-4-7"
+```
+
+That:
+
+1. Symlinks `~/.bashrc`, `~/.bash_history`, `~/.claude/`, etc. into `$HOME`.
+2. Puts `devenv` on PATH at `~/.local/bin/devenv`.
+3. Runs all install modules (`base`, `node`, `python`, `claude`).
+
+Then open a new shell (or `source ~/.bashrc`).
 
 ## Day-to-day
 
 ```bash
-devenv list                 # modules + which are installed
-devenv install base node    # (re)run modules in order   (or: all)
-devenv doctor               # verify symlinks + tool availability
-devenv init                 # re-link dotfiles (safe, idempotent)
-devenv snapshots            # list retained versions, newest first
-devenv restore --rollback   # restore previous version after a bad snapshot
+devenv list                       # show modules + which are marked installed
+devenv install node               # (re)run one module
+devenv install base node          # run several in order
+devenv install all                # full toolchain
+devenv doctor                     # verify symlinks + tool availability
+devenv init                       # re-link dotfiles (idempotent, safe)
+devenv sync                       # if home/ is a git repo, show drift
+devenv snapshots                  # list retained snapshot versions (newest first)
+devenv restore --rollback         # restore the previous version (after a bad snapshot)
+devenv probe -- npm test          # measure VM degradation signals around a workload
+devenv watch --tail               # show recent degradation episodes caught by the watcher
 ```
 
 ## What persists
 
+Anything you'd otherwise have to rewrite from memory after a reinstall:
+
 | Path | Mechanism | Purpose |
 |---|---|---|
-| `home/.bashrc`, `.gitconfig`, `.inputrc`, `.npmrc`, … | symlink | shell / git / readline / npm config |
-| `state/home/.config/` | snapshot dir | XDG configs (nvim, systemd --user, …) |
-| `state/home/.bash_history` | snapshot file | history, flushed every command |
-| `state/files/.claude/CLAUDE.md` | snapshot file | Claude global guidance (seeded from `home/.claude/CLAUDE.md`) |
-| `state/files/.claude/.credentials.json` | snapshot file | Claude auth token (chmod 600 on restore) |
-| `state/files/.claude/claude-json-auth.json` | json-merge | auth subset of `~/.claude.json`, merged back on restore |
-| `archives/ssh.tar.gz` | tar archive | `~/.ssh` (tar preserves 700/600 across FUSE) |
+| `home/.bashrc`, `.bash_profile`, `.profile` | symlink | shell config |
+| `home/.inputrc` | symlink | readline tweaks |
+| `home/.gitconfig` | symlink | git identity + aliases |
+| `home/.npmrc` | symlink | npm config |
+| `state/home/.config/` | snapshot dir | XDG configs (nvim, etc.) |
+| `state/home/.bash_history` | snapshot file | full history; flushed every command |
+| `state/files/.claude/CLAUDE.md` | snapshot file | Claude Code global guidance (seeded from `home/.claude/CLAUDE.md` on first run) |
+| `state/files/.claude/.credentials.json` | snapshot file | Claude Code auth token (chmod 600 on restore) |
+| `archives/ssh.tar.gz` | tar archive | `~/.ssh` — keys, `known_hosts`, `authorized_keys` (tar preserves 700/600 perms across FUSE) |
+| `metrics/probe.jsonl`, `metrics/episodes.jsonl` | append-only log | VM health / degradation signals, trended **across** rebuilds (see Health & degradation monitoring) |
 
-**Not persisted** (cheap to rebuild): apt packages, Node/nvm, pipx envs, the
-Claude binary, and plugins/skills (reinstalled from `modules/claude-*.txt`
-manifests). The rest of `~/.claude/` and bulk `~/.claude.json` are deliberately
-dropped — bulk-snapshotting either once corrupted the VM — so **`/resume` does
-not survive a rebuild**, and persistence inside `~/.claude/` is opt-in per file.
-The seeded `CLAUDE.md` tells Claude to track durable state in project-local
-`CLAUDE.md` files instead.
+What does **not** persist (by design — reinstall is cheap, modules re-establish):
+
+- apt packages (re-installed by `install-base`)
+- `~/.nvm/` and Node binaries (re-installed by `install-node`)
+- pipx envs (re-installed by `install-python`)
+- the Claude binary itself (re-installed by `install-claude`)
+- Claude Code plugins, marketplaces, and user-installed skills (re-installed by `install-claude-plugins` from manifests in `modules/claude-{marketplaces,plugins,skills}.txt`)
+- code-server, autossh, and the VS Code launcher scripts `code-local` / `pc-tunnel` / `pc-setup-code-web` (re-installed by the opt-in `install-vscode` — VS Code in the phone browser for local files at `localhost:8080` and PC files at `localhost:8001` through the cloudflared ssh tunnel; see header of `modules/install-vscode.sh`)
+- the rest of `~/.claude/` — sessions, `projects/`, auto-memory, `file-history`, `settings.json`, `~/.claude.json`, telemetry. **`/resume` does not survive a VM rebuild.** A bulk `~/.claude/` snapshot once corrupted the VM, so persistence inside that directory is now opt-in per-file via `SNAPSHOT_FILES` in `bin/lib.sh`. The seeded `~/.claude/CLAUDE.md` instructs Claude to track durable project state in project-local `CLAUDE.md` files instead of relying on the auto-memory system.
 
 ## Snapshots & rollback
 
-`devenv snapshot` writes `snapshots/<timestamp>/` and keeps the 3 newest;
-`bootstrap.sh` snapshots as its last step, so every retained version comes from a
-system that just booted successfully (valid by construction). There is no
-shutdown-time snapshot — capturing a possibly-broken moment is exactly what this
-avoids.
+Snapshots are **versioned**. Each `devenv snapshot` writes a new
+`snapshots/<timestamp>/` directory and keeps the **3 newest**. `bootstrap.sh`
+takes a snapshot automatically as its final step, so every retained version
+comes from a system that just booted successfully — valid by construction. A
+`meta` file written last marks a version complete (the shared mount has no
+atomic rename).
 
-- `devenv snapshots` — list, newest first.
-- `devenv restore [--rollback[=N]]` — restore the newest, or N versions back. Use the rollback form when a fresh `bootstrap.sh` restored a snapshot that breaks the VM. The same flag works on `bootstrap.sh`.
+- `devenv snapshots` — list the retained versions, newest first; the newest is
+  what a plain restore uses.
+- `devenv restore` — restore the newest version (this is what `bootstrap.sh`
+  does).
+- `devenv restore --rollback` — restore the version before newest. Use this when
+  a fresh `bootstrap.sh` restored a snapshot that breaks the VM.
+- `devenv restore --rollback=2` — go two versions back.
+- `bash bootstrap.sh --rollback[=N]` — same, during a full rebuild.
 
-## Extending
+There is no shutdown-time snapshot: capturing state at an arbitrary (possibly
+broken) moment is exactly what the versioned, boot-only model avoids.
 
-**Add a module** — drop `modules/install-<name>.sh` (source `../bin/lib.sh`,
-detect-installed-and-exit-0-fast, use `maybe_sudo`/`have`; the dispatcher writes
-the success sentinel). Auto-discovered.
+## Health & degradation monitoring
 
-**Persist a dotfile** — pick the mechanism by editing the matching array in
-`bin/lib.sh`:
+The VM tends to degrade only under heavy work (node/python scripts, multi-agent
+runs), not at idle. Two collectors capture the kernel's own degradation signals
+— PSI stall (`/proc/pressure/{cpu,memory,io}`), `MemAvailable` low-water, zram
+use, OOM/hung-task events, shared-mount latency — and log them to `metrics/` on
+the shared mount so the data **trends across rebuilds**. The goal is to harden
+from measured failure, not gut feeling. Full design: [`docs/harden-spec.md`](docs/harden-spec.md).
 
-| Kind | Array | Storage |
-|---|---|---|
-| read-mostly dotfile | `LINK_DOTFILES` | symlink from `home/` |
-| stateful dir (XDG, SQLite) | `STATEFUL_DIRS` | rsync into `state/home/` |
-| single file in a dir you *don't* bulk-snapshot | `SNAPSHOT_FILES` | `state/files/<path>`; `home/<path>` seeds first run |
-| a few keys of a JSON file | `CLAUDE_JSON_AUTH_KEYS` | jq-merged (`_snapshot/_restore_claude_json` in `bin/devenv`) |
-| needs strict mode bits across FUSE | `ARCHIVE_DIRS` | `archives/<name>.tar.gz` |
+**`devenv probe`** — deliberate, point-in-time. Appends one JSON line to
+`metrics/probe.jsonl`. `bootstrap.sh` runs it once per boot (`--label
+boot-baseline`) — but a fresh VM always looks fine, so baselines answer "did
+this boot start clean", not "what degrades under load".
 
-Don't put bulk / churny / daemon-written dirs in `STATEFUL_DIRS` — that's how the
-`~/.claude/` corruption happened.
+```bash
+devenv probe                      # one-shot snapshot + human summary
+devenv probe --watch 60           # sample a 60s window (peak / low-water / PSI deltas)
+devenv probe -- cargo build       # run a workload, measure until it exits
+devenv probe --tail 20            # show recent samples
+```
 
-**Add a Claude plugin or skill** — append to a manifest, then
-`devenv install claude-plugins` (idempotent):
+**`devenv watch`** — automatic, the load-time companion. A systemd `--user`
+service (installed + enabled by `install-watch`, in the default bootstrap set)
+that is near-silent when calm — every 15s it reads only the PSI files, no
+`ps`/`dmesg`, **no log write** — and records **one coalesced episode** (with the
+culprit process tree: who's eating RSS/CPU) to `metrics/episodes.jsonl` *only*
+when stall / low-mem / OOM trips. So the log grows with how often the VM
+actually struggles, and each row tells you the *why*.
 
-- `modules/claude-marketplaces.txt` — `owner/repo`
-- `modules/claude-plugins.txt` — `<plugin>@<marketplace>`
-- `modules/claude-skills.txt` — `<git-url> [name]`
+```bash
+systemctl --user status devenv-watch.service     # is the watcher running?
+devenv watch --tail 20                            # recent degradation episodes
+jq -r '.top_procs[0].comm' metrics/episodes.jsonl | sort | uniq -c | sort -rn   # recurring culprit
+jq 'select(.psi_us.mem_full>0 or .oom_events>0)' metrics/episodes.jsonl          # any real memory pressure?
+```
 
-## Why this exists
+Thresholds and cadence are env-tunable (`DEVENV_WATCH_*`, see the unit and
+`docs/harden-spec.md`). No hardening levers (earlyoom, tmpfs, swappiness) are
+enabled yet — the spec gates each one on a signal the episode log has to show
+first. As of the baselines, only IO stall (shared mount) ever fires; memory is
+clean.
 
-Android 16's Linux Terminal runs Debian in a crosvm VM (AVF). It's experimental,
-the disk lives in unreachable app-private storage, and two failure modes force
-reinstalls: an ungraceful shutdown (app swipe / OOM kill) poisons the next boot
-(crash-loop → the dev-options toggle that "fixes" it wipes the disk), and
-half-written state on `/mnt/shared` (virtio-fs, no reliable locking or atomic
-rename) corrupts files that take down the next launch. This repo assumes the
-wipes keep happening and makes recovery cheap.
+## Adding a module
 
-## Gotchas
+Drop `modules/install-<name>.sh` into `modules/`. The dispatcher picks it up automatically.
 
-- **Never `cp` when any path is under `/mnt/shared`** — use `rsync`. The FUSE/sdcardfs bridge can crash the VM mid-copy (zero-length files, hang, app reset).
-- `/mnt/shared` may not honor mode bits — that's why `~/.ssh` / `~/.gnupg` go through `ARCHIVE_DIRS` tar, not `home/`.
-- `~/.claude/` is not bulk-snapshotted and `~/.claude.json` carries only its auth subset (both corrupted the VM whole) — MCP registrations and other fields don't survive; re-add after a rebuild.
-- Concurrent shells interleave `.bash_history` despite the `history -a` PROMPT_COMMAND.
-- `devenv init` backs up real files to `~/.devenv-backup/<timestamp>/` before linking — safe to re-run.
+Module contract:
+
+- Source `../bin/lib.sh` at the top.
+- Detect already-installed state and exit 0 fast.
+- Use `maybe_sudo` for root-required commands.
+- Use `have <cmd>` to test for tools.
+- The dispatcher writes the success sentinel — your module just needs to exit 0.
+
+## Adding a dotfile to persist
+
+Pick the right mechanism for the file:
+
+- **Read-mostly dotfile** (`.bashrc`, `.gitconfig`, …) — put under `home/`, add to `LINK_DOTFILES` in `bin/lib.sh`, `devenv init` to symlink. Whole directories are linked as one symlink.
+- **Stateful directory** (XDG dirs, SQLite-backed apps) — add to `STATEFUL_DIRS` in `bin/lib.sh`. Managed by `devenv snapshot` / `devenv restore` via rsync. **Do not** add anything that bulk-mishaves (large opaque dir, frequent churn, daemons writing while snapshot runs) — see the `~/.claude/` incident.
+- **Single file inside a directory we deliberately don't bulk-snapshot** (e.g. `~/.claude/CLAUDE.md`) — add the HOME-relative path to `SNAPSHOT_FILES` in `bin/lib.sh`. Snapshot/restore handle one file at a time. A matching file under `home/<path>` acts as a first-run seed template.
+- **Anything needing strict mode bits across FUSE/sdcardfs** (`~/.ssh`, `~/.gnupg`) — add to `ARCHIVE_DIRS` in `bin/lib.sh`. Stored as tar.gz so perms survive.
+
+## Adding a Claude Code plugin or skill
+
+Plugins and skills aren't persisted directly — they're reinstalled from manifests on each rebuild via `modules/install-claude-plugins.sh`:
+
+- Marketplace: append a source to `modules/claude-marketplaces.txt`
+- Plugin: append `<plugin>@<marketplace>` to `modules/claude-plugins.txt`
+- Skill: append a `<git-url> [name]` line to `modules/claude-skills.txt`
+
+`devenv install claude-plugins` (re)runs the install. Idempotent — already-installed entries are skipped.
+
+## Risks / known limits
+
+- `/mnt/shared/` on Android is typically FUSE/sdcardfs and may not honor unix mode bits. That's why `~/.ssh` lives in `archives/ssh.tar.gz` (tar bakes 700/600 into the archive metadata) instead of `home/.ssh/` (which would lose perms on the FUSE round-trip). `~/.gnupg` would need the same treatment — see `ARCHIVE_DIRS` in `bin/lib.sh` to add more.
+- Concurrent shells fight for `.bash_history`. The `history -a` PROMPT_COMMAND in `.bashrc` mitigates loss but two simultaneous edits can interleave.
+- `devenv init` never overwrites real files — it backs them up to `~/.devenv-backup/<timestamp>/`. Safe to re-run.

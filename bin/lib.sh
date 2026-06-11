@@ -20,6 +20,15 @@ DEVENV_STATE="$DEVENV_ROOT/archives/state"
 DEVENV_SNAPSHOT_DIR="$DEVENV_ROOT/state"
 export DEVENV_ROOT DEVENV_BIN DEVENV_HOME DEVENV_MODULES DEVENV_STATE DEVENV_SNAPSHOT_DIR
 
+# Where `devenv probe` appends its degradation-signal samples. JSONL, one
+# object per line, on the persistence layer so it trends ACROSS VM rebuilds
+# (the whole point — a single boot tells you nothing; the cross-rebuild trend
+# is what reveals what actually degrades this VM). Append-only: the shared
+# mount has no flock, but a single small-line append from the one probe writer
+# does not contend, so we tolerate it (never rewrite the file in place).
+DEVENV_METRICS="$DEVENV_ROOT/metrics"
+export DEVENV_METRICS
+
 # Versioned snapshot store. Each version is one complete dir under here named
 # by a sortable UTC timestamp; the newest is "current". A `meta` file written
 # LAST marks a version complete (the shared mount has no atomic rename, so we
@@ -35,6 +44,7 @@ LINK_DOTFILES=(
     .bashrc
     .bash_profile
     .profile
+    .bash_aliases
     .inputrc
     .gitconfig
     .npmrc

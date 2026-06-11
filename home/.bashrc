@@ -38,6 +38,10 @@ alias gs='git status'
 alias gd='git diff'
 alias gl='git log --oneline --graph --decorate -20'
 
+# Claude Code launchers (raise stack limit + disable flicker/mouse for terminal)
+alias claude='ulimit -s unlimited && CLAUDE_CODE_NO_FLICKER=1 CLAUDE_CODE_DISABLE_MOUSE=1 claude'
+alias claudea='ulimit -s unlimited && CLAUDE_CODE_NO_FLICKER=1 CLAUDE_CODE_DISABLE_MOUSE=1 claude --permission-mode auto'
+
 # bat is named batcat on Debian; init.sh / base module symlinks it
 have() { command -v "$1" >/dev/null 2>&1; }
 if have batcat && ! have bat; then alias bat='batcat'; fi

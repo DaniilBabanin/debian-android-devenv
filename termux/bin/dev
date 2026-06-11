@@ -42,8 +42,19 @@ dev — proot guest workspace: named, auto-tiled panes in one tmux view
   dev -c CMD [ARGS...]  one-off command inside the guest, no tmux: login
                         shell, aliases available (dev -c devenv doctor,
                         dev -c claudea), exit code propagates
+  dev doctor            Termux-side health check (mitigation marker, snapshot
+                        freshness, rootfs backup age, guest login, dev binary)
+  dev backup            tar the proot rootfs to <repo>/backups/ (keeps 2) —
+                        disaster recovery for uninstall/data-clear
   dev -l                list sessions and their panes
   dev -h                this help
+
+('doctor' and 'backup' are reserved words, not usable as pane names.)
+
+self-maintenance on every run: if the repo copy of this script differs from
+the installed one it reinstalls itself, and if the newest devenv snapshot is
+older than DEV_SNAPSHOT_MAX_AGE_DAYS (default 3, 0 = off) a background
+`devenv snapshot` refreshes it (Termux notification on completion).
 
 keys: tap a pane to focus it (mouse on), Ctrl-b z zoom/unzoom one pane (THE
 phone gesture), Ctrl-b arrows move, Ctrl-b % / " extra splits (auto-login +
@@ -64,6 +75,222 @@ wake() { termux-wake-lock 2>/dev/null || true; }
 valid_name() {
     case "$1" in *[!A-Za-z0-9_-]*|'') return 1 ;; *) return 0 ;; esac
 }
+
+# ---- self-maintenance ---------------------------------------------------------
+# Termux is the primary runtime now: the guest both consumes AND produces the
+# devenv snapshots, and `dev` keeps itself and the snapshot window fresh so
+# neither needs remembering.
+
+REPO="${DEVENV_REPO:-/storage/emulated/0/Sync/debian-env}"
+STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/devenv"
+MITIGATE_MARKER="${XDG_STATE_HOME:-$HOME/.local/state}/devenv-mitigate.done"
+
+c_ok()   { printf '\033[32m[ ok ]\033[0m %s\n' "$*"; }
+c_warn() { printf '\033[33m[warn]\033[0m %s\n' "$*" >&2; }
+c_log()  { printf '\033[34m[dev ]\033[0m %s\n' "$*"; }
+
+# Reinstall $PREFIX/bin/dev whenever the repo copy changed, then re-exec the
+# new version with the original args. Kills the recurring "NOTE: reinstall
+# needed" footgun — editing termux/bin/dev in the repo is enough.
+self_update() {
+    local src="$REPO/termux/bin/dev" inst="$PREFIX/bin/dev"
+    [ -f "$src" ] || return 0
+    cmp -s "$src" "$inst" 2>/dev/null && return 0
+    install -m 0755 "$src" "$inst" || { c_warn "dev: self-update failed (left as-is)"; return 0; }
+    c_log "self-updated from repo copy"
+    case "$(readlink -f "$0" 2>/dev/null || printf '%s' "$0")" in
+        "$inst") exec "$inst" "$@" ;;
+    esac
+}
+
+# Age (days) of the newest complete snapshot version; 9999 if none.
+# Globs expand in ascending name order (names are sortable UTC timestamps),
+# so the last match is the newest.
+snapshot_age_days() {
+    local ts="" d base
+    for d in "$REPO/snapshots"/*/; do
+        base="${d%/}"; base="${base##*/}"
+        case "$base" in
+            [0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]-[0-9][0-9][0-9][0-9][0-9][0-9])
+                [ -f "$d/meta" ] && ts="$base" ;;
+        esac
+    done
+    [ -n "$ts" ] || { echo 9999; return 0; }
+    local epoch
+    epoch="$(date -u -d "${ts:0:4}-${ts:4:2}-${ts:6:2} ${ts:9:2}:${ts:11:2}:${ts:13:2} UTC" +%s 2>/dev/null)" \
+        || { echo 9999; return 0; }
+    echo $(( ( $(date +%s) - epoch ) / 86400 ))
+}
+
+# If the newest snapshot is older than DEV_SNAPSHOT_MAX_AGE_DAYS (default 3,
+# 0 disables), refresh it in the background. Lock lives on Termux ext4 (the
+# shared mount has no flock); a pid file inside detects stale locks.
+maybe_snapshot() {
+    [ -d "$REPO/snapshots" ] || return 0          # devenv not bootstrapped yet
+    local max="${DEV_SNAPSHOT_MAX_AGE_DAYS:-3}"
+    [ "$max" = 0 ] && return 0
+    local age; age="$(snapshot_age_days)"
+    [ "$age" -ge "$max" ] || return 0
+    local lock="$STATE_DIR/snapshot.lock"
+    mkdir -p "$STATE_DIR"
+    if ! mkdir "$lock" 2>/dev/null; then
+        local pid; pid="$(cat "$lock/pid" 2>/dev/null || true)"
+        if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then return 0; fi
+        rm -rf "$lock"
+        mkdir "$lock" 2>/dev/null || return 0
+    fi
+    c_log "snapshot is ${age}d old — refreshing in background (log: $STATE_DIR/snapshot.log)"
+    (
+        trap '' HUP                                # survive tab close / detach
+        echo "$BASHPID" > "$lock/pid"
+        if "${login[@]}" -- bash -lc 'devenv snapshot' >"$STATE_DIR/snapshot.log" 2>&1; then
+            termux-notification --title 'devenv: snapshot refreshed' \
+                --content "previous was ${age}d old" 2>/dev/null || true
+        else
+            termux-notification --title 'devenv: snapshot FAILED' \
+                --content "see $STATE_DIR/snapshot.log" 2>/dev/null || true
+        fi
+        rmdir "$lock" 2>/dev/null || true
+    ) >/dev/null 2>&1 &
+}
+
+# ---- dev backup ----------------------------------------------------------------
+# Whole-rootfs disaster recovery: proot rootfs + guest $HOME live in Termux app
+# data and die on uninstall/data-clear; the devenv snapshots only carry dotfiles
+# and creds. `proot-distro backup` is the only format its restore path
+# guarantees (ownership zeroed, hard links materialized). Recovery:
+#   proot-distro restore <repo>/backups/debian-<ts>.tar.gz
+cmd_backup() {
+    local force=0
+    [ "${1:-}" = "--force" ] && force=1
+    local dir="$REPO/backups"
+    [ -d "$REPO" ] || { c_warn "repo not found at $REPO"; exit 1; }
+
+    # A backup of a live container can produce a broken restore (mid-write
+    # files); refuse while guest sessions run unless forced.
+    if [ "$force" = 0 ]; then
+        if command -v pgrep >/dev/null 2>&1; then
+            if pgrep -f 'proot.*debian' >/dev/null 2>&1; then
+                c_warn "guest sessions are running — exit them first (tmux kill-server), or: dev backup --force"
+                exit 1
+            fi
+        elif tmux has-session 2>/dev/null; then
+            c_warn "tmux sessions exist (cannot pgrep for proot) — tmux kill-server first, or: dev backup --force"
+            exit 1
+        fi
+    fi
+
+    wake
+    mkdir -p "$dir"
+    local ts out
+    ts="$(date -u +%Y%m%d-%H%M%S)"
+    out="$dir/debian-$ts.tar.gz"
+    c_log "backing up rootfs -> $out (several GB, takes a while; phone plugged in?)"
+    if ! proot-distro backup debian --output "$out"; then
+        rm -f "$out"
+        c_warn "backup failed"
+        exit 1
+    fi
+    c_ok "backup done: $out ($(du -h "$out" 2>/dev/null | cut -f1))"
+
+    # Keep the newest DEV_BACKUP_RETAIN (default 2). Glob order is ascending
+    # timestamp, so prune from the front of the list.
+    local keep="${DEV_BACKUP_RETAIN:-2}" f
+    local -a backs=()
+    for f in "$dir"/debian-*.tar.gz; do [ -e "$f" ] && backs+=("$f"); done
+    local n=${#backs[@]} i=0
+    while [ $(( n - i )) -gt "$keep" ]; do
+        rm -f "${backs[$i]}"
+        c_log "pruned old backup: $(basename "${backs[$i]}")"
+        i=$((i+1))
+    done
+    c_log "restore on a fresh Termux: pkg install proot-distro && proot-distro restore <file>"
+}
+
+# Age (days) of the newest rootfs backup; 9999 if none.
+backup_age_days() {
+    local f="" g
+    for g in "$REPO"/backups/debian-*.tar.gz; do [ -e "$g" ] && f="$g"; done
+    [ -n "$f" ] || { echo 9999; return 0; }
+    echo $(( ( $(date +%s) - $(stat -c %Y "$f" 2>/dev/null || echo 0) ) / 86400 ))
+}
+
+# ---- dev doctor ----------------------------------------------------------------
+# Termux-side health check — the counterpart of the guest's `devenv doctor`.
+cmd_doctor() {
+    local fails=0
+
+    if [ -d "$REPO" ]; then c_ok "repo: $REPO"; else c_warn "repo missing at $REPO (set DEVENV_REPO?)"; fails=$((fails+1)); fi
+
+    if cmp -s "$REPO/termux/bin/dev" "$PREFIX/bin/dev" 2>/dev/null; then
+        c_ok "dev binary current"
+    else
+        c_warn "dev binary differs from repo copy (self-update will fix on next plain run)"; fails=$((fails+1))
+    fi
+
+    if [ -f "$MITIGATE_MARKER" ]; then
+        c_ok "phantom-killer mitigation marker: $(cat "$MITIGATE_MARKER")"
+        c_log "  flag can silently reset on Android updates — after one, or on any signal-9, run: bash $REPO/termux/mitigate.sh --verify"
+    else
+        c_warn "mitigation never applied — run: bash $REPO/termux/mitigate.sh"; fails=$((fails+1))
+    fi
+
+    if grep -q 'KEYBOARD' "$HOME/.termux/termux.properties" 2>/dev/null; then
+        c_ok "termux.properties: KEYBOARD extra key present"
+    else
+        c_warn "termux.properties missing KEYBOARD extra key (re-run termux/bootstrap.sh)"; fails=$((fails+1))
+    fi
+
+    if command -v termux-notification >/dev/null 2>&1; then
+        c_ok "termux-api present"
+    else
+        c_warn "termux-api missing (notifications dead) — pkg install termux-api"; fails=$((fails+1))
+    fi
+
+    if "${login[@]}" -- true >/dev/null 2>&1; then
+        c_ok "guest login works"
+    else
+        c_warn "guest login FAILED — re-run termux/bootstrap.sh"; fails=$((fails+1))
+    fi
+
+    local age max="${DEV_SNAPSHOT_MAX_AGE_DAYS:-3}"
+    age="$(snapshot_age_days)"
+    if [ "$age" = 9999 ]; then
+        c_warn "no devenv snapshot yet (run: dev -c devenv snapshot)"; fails=$((fails+1))
+    elif [ "$max" != 0 ] && [ "$age" -ge "$max" ]; then
+        c_warn "newest snapshot is ${age}d old (auto-refresh runs on next plain 'dev')"
+    else
+        c_ok "snapshot fresh (${age}d old)"
+    fi
+
+    age="$(backup_age_days)"
+    if [ "$age" = 9999 ]; then
+        c_warn "no rootfs backup yet — run: dev backup"; fails=$((fails+1))
+    elif [ "$age" -ge "${DEV_BACKUP_MAX_AGE_DAYS:-30}" ]; then
+        c_warn "newest rootfs backup is ${age}d old — consider: dev backup"
+    else
+        c_ok "rootfs backup fresh (${age}d old)"
+    fi
+
+    local sess
+    sess="$(tmux list-sessions 2>/dev/null || true)"
+    if [ -n "$sess" ]; then
+        printf '%s\n' "$sess" | sed 's/^/       tmux: /'
+    else
+        c_log "tmux: no server running"
+    fi
+
+    if [ "$fails" -eq 0 ]; then c_ok "doctor: all clear"; else c_warn "doctor: $fails issue(s)"; return 1; fi
+}
+
+# Keep the installed copy in sync with the repo before anything else.
+self_update "$@"
+
+# Subcommands (reserved words — not usable as pane names).
+case "${1:-}" in
+    doctor) cmd_doctor; exit ;;
+    backup) shift; cmd_backup "$@"; exit ;;
+esac
 
 session=dev
 session_explicit=0   # set by -s; suppresses name-derived session
@@ -91,6 +318,7 @@ while [ $# -gt 0 ]; do
             # One-off in a guest login shell: -l pulls in .profile (PATH incl.
             # ~/.local/bin), -i makes .bashrc define the claude/claudea aliases.
             wake
+            maybe_snapshot
             cmd="$(printf '%q ' "$@")"
             exec "${login[@]}" -- bash -lic "$cmd" ;;
         -*)
@@ -113,6 +341,7 @@ if [ "$session_explicit" = 0 ] && [ ${#names[@]} -gt 0 ]; then
 fi
 
 wake
+maybe_snapshot
 
 # ---- ensure the session exists and is configured ------------------------------
 # Targets use the bare session name: tmux resolves exact names first, and the

@@ -39,6 +39,18 @@ Commands:
   restore [--rollback[=N]]       reverse of snapshot. Default restores the newest
                                  version; --rollback restores the previous one,
                                  --rollback=N goes back N versions.
+  probe [--watch S] [--label L]  sample VM degradation signals (PSI stall, mem
+        [--tail [N]] [-- cmd]    low-water, zram, OOM events, shared-mount
+                                 latency) and append to metrics/probe.jsonl.
+                                 --watch S samples for S seconds; -- cmd runs a
+                                 workload and measures until it exits; --tail
+                                 shows recent samples. See docs/harden-spec.md.
+  watch [--once] [--tail [N]]    adaptive degradation daemon: near-silent when
+                                 calm, writes one coalesced episode (+ culprit
+                                 process tree) to metrics/episodes.jsonl only
+                                 when PSI stall / low-mem / OOM trips. Runs as a
+                                 systemd --user service (install-watch module).
+                                 --tail shows recent episodes.
   help                           this message
 
 Modules ship in: $DEVENV_MODULES
@@ -72,7 +84,7 @@ cmd_install() {
     local mods=()
     if [ "$1" = "all" ]; then
         # Default order — modules with deps must come after their deps.
-        local preferred=(base node python claude claude-plugins)
+        local preferred=(base node python claude claude-plugins watch)
         local available; available="$(list_modules)"
         local m
         for m in "${preferred[@]}"; do
@@ -166,7 +178,7 @@ cmd_doctor() {
     local m t
     while IFS= read -r m; do
         case "$m" in
-            base)   for t in gcc git curl jq tmux nvim fzf rg; do
+            base)   for t in gcc git curl jq tmux fzf rg; do
                         if have "$t"; then ok "base: $t"; else warn "base: missing $t"; fails=$((fails+1)); fi
                     done ;;
             node)   if have nvm || [ -s "$HOME/.nvm/nvm.sh" ]; then ok "node: nvm present"; else warn "node: nvm missing"; fails=$((fails+1)); fi
@@ -188,6 +200,57 @@ cmd_doctor() {
                     ok "claude-skills: ${scount:-0} cloned"
                 else
                     warn "claude-plugins: claude CLI missing"; fails=$((fails+1))
+                fi ;;
+            cloudflared)
+                if have cloudflared; then
+                    ok "cloudflared: $(cloudflared --version 2>&1 | head -1)"
+                else
+                    warn "cloudflared: missing (run: devenv install cloudflared)"; fails=$((fails+1))
+                fi
+                if [ -f "$HOME/.ssh/config" ] && grep -qE '^[[:space:]]*Host[[:space:]]+ssh\.babanin\.de([[:space:]]|$)' "$HOME/.ssh/config"; then
+                    ok "cloudflared: ~/.ssh/config has Host ssh.babanin.de"
+                else
+                    warn "cloudflared: ~/.ssh/config missing Host ssh.babanin.de (run: devenv install cloudflared)"; fails=$((fails+1))
+                fi
+                if [ -f "$HOME/.ssh/id_ed25519" ]; then
+                    local _kmode; _kmode="$(stat -c '%a' "$HOME/.ssh/id_ed25519" 2>/dev/null || echo '?')"
+                    if [ "$_kmode" = 600 ]; then
+                        ok "cloudflared: ~/.ssh/id_ed25519 present (mode 600)"
+                    else
+                        warn "cloudflared: ~/.ssh/id_ed25519 mode is $_kmode, expected 600 (run: devenv restore, or chmod 600)"; fails=$((fails+1))
+                    fi
+                else
+                    warn "cloudflared: ~/.ssh/id_ed25519 missing — the private key is the access credential (restore it: devenv restore)"; fails=$((fails+1))
+                fi
+                # DNS: do NOT use `getent` here — it resolves via nsswitch's
+                # `resolve` module (systemd-resolved) and succeeds even when
+                # /etc/resolv.conf is broken. cloudflared (a Go binary) reads
+                # /etc/resolv.conf DIRECTLY, so the real test is whether the
+                # resolv.conf nameserver is reachable. A dead one (e.g. the GCE
+                # metadata resolver 169.254.169.254) makes cloudflared hang on
+                # DNS and ssh time out while getent still "works".
+                local _ns
+                _ns="$(grep -m1 '^[[:space:]]*nameserver' /etc/resolv.conf 2>/dev/null | awk '{print $2}')"
+                if [ -z "$_ns" ]; then
+                    warn "cloudflared: /etc/resolv.conf has no nameserver"; fails=$((fails+1))
+                elif timeout 2 bash -c "exec 3<>/dev/tcp/$_ns/53" 2>/dev/null; then
+                    ok "cloudflared: resolv.conf nameserver $_ns reachable (cloudflared DNS path OK)"
+                else
+                    warn "cloudflared: resolv.conf nameserver $_ns UNREACHABLE — cloudflared will hang on DNS even though getent works (run: devenv install cloudflared to repoint at the systemd-resolved stub)"; fails=$((fails+1))
+                fi
+                # Cloudflare Access: ssh.babanin.de sits behind Zero Trust Access.
+                # Without a cached token cloudflared can't complete the SSH banner
+                # exchange (ssh reports "Connection timed out during banner
+                # exchange"). The token lives in ~/.cloudflared/*-token and does
+                # NOT survive a VM rebuild, so this is a soft warn, not a fail.
+                # nullglob is set (line ~118), so an unmatched glob vanishes and
+                # `ls DIR/*-token` would degrade to `ls DIR` and falsely pass.
+                # Collect into an array and test the first element instead.
+                local _toks; _toks=("$HOME/.cloudflared"/*-token)
+                if [ "${#_toks[@]}" -gt 0 ] && [ -e "${_toks[0]}" ]; then
+                    ok "cloudflared: Cloudflare Access token cached"
+                else
+                    warn "cloudflared: no Cloudflare Access token — run 'cloudflared access login https://ssh.babanin.de' (or configure a service token) before ssh will connect"
                 fi ;;
         esac
     done < <(list_modules)
@@ -295,6 +358,9 @@ _snapshot_entry() {
             --exclude='*.db-wal' --exclude='*.db-shm' --exclude='*.lock' \
             --exclude='*.wants/' \
             --exclude='systemd/user/devenv-snapshot.service' \
+            --exclude='systemd/user/devenv-watch.service' \
+            --exclude='pulse/' \
+            --exclude='btop/btop.log' \
             "$src/" "$dst/"
         ok "snapshot: ~/$name/"
     else
@@ -717,6 +783,315 @@ cmd_snapshots() {
     done < <(_list_versions)
 }
 
+# ---------------------------------------------------------------------------
+# probe — measure the signals that actually predict VM degradation
+# ---------------------------------------------------------------------------
+# Philosophy: don't harden on gut feeling. Sample the kernel's own stall and
+# pressure signals, append them to a cross-rebuild log, and let the TREND tell
+# us which lever (if any) is worth pulling. See docs/harden-spec.md for the
+# symptom -> signal -> lever framework this feeds.
+#
+# Signals collected (all read-only, no sudo needed on this kernel):
+#   - PSI  /proc/pressure/{cpu,memory,io}  total= microseconds  (THE stall
+#          signal: "full" memory/io means tasks were literally stalled waiting)
+#   - mem  /proc/meminfo MemAvailable low-water + SwapUsed (zram) high-water
+#   - zram /sys/block/zram0/mm_stat mem_used_total high-water (near-full zram =
+#          the next allocation OOMs)
+#   - oom  dmesg matches for oom-kill / Killed process / hung_task / blocked-for
+#   - io   timed ls of the shared mount root (its latency IS the degradation
+#          everyone feels first)
+#   - peak RSS of the claude process tree (the agent is the VM's single point of
+#          failure; if it gets OOM-killed the session dies)
+
+# Read one numeric field (kB) from /proc/meminfo.
+_meminfo_kb() { awk -v k="$1:" '$1==k{print $2; exit}' /proc/meminfo 2>/dev/null || echo 0; }
+
+# PSI total microseconds for <resource> <some|full>. 0 if unavailable.
+_psi_total() {
+    awk -v want="$2" '$1==want{for(i=2;i<=NF;i++) if($i ~ /^total=/){sub(/total=/,"",$i); print $i; exit}}' \
+        "/proc/pressure/$1" 2>/dev/null || echo 0
+}
+
+# zram mem_used_total (bytes) — 3rd field of mm_stat.
+_zram_memused() { awk '{print $3; exit}' /sys/block/zram0/mm_stat 2>/dev/null || echo 0; }
+
+# Sum RSS (kB) of every process whose command line matches a regex.
+_match_rss() { ps -eo rss=,args= 2>/dev/null | awk -v p="$1" '$0 ~ p && $0 !~ /devenv probe/ {s+=$1} END{print s+0}'; }
+
+# Count cumulative kernel degradation events in the ring buffer.
+_oom_count() { dmesg 2>/dev/null | grep -ciE 'out of memory|killed process|oom-kill|hung_task|blocked for more than [0-9]+ sec' || true; }
+
+# Round-trip latency (ms) of a trivial op on the shared mount.
+_shared_latency_ms() {
+    local t0 t1; t0=$(date +%s%N); ls "$DEVENV_ROOT" >/dev/null 2>&1; t1=$(date +%s%N)
+    echo $(( (t1 - t0) / 1000000 ))
+}
+
+cmd_probe() {
+    local watch=0 label="snapshot" interval=2
+    local -a runcmd=()
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --watch)    watch="${2:?--watch needs SECONDS}"; shift 2 ;;
+            --watch=*)  watch="${1#*=}"; shift ;;
+            --label)    label="${2:?--label needs a value}"; shift 2 ;;
+            --label=*)  label="${1#*=}"; shift ;;
+            --tail)     shift; tail -n "${1:-20}" "$DEVENV_METRICS/probe.jsonl" 2>/dev/null || warn "no probe log yet"; return 0 ;;
+            --)         shift; runcmd=("$@"); break ;;
+            *)          die "probe: unknown arg: $1 (see: devenv help)" ;;
+        esac
+    done
+    mkdir -p "$DEVENV_METRICS"
+    local log="$DEVENV_METRICS/probe.jsonl"
+
+    local mode="snapshot"
+    [ "$watch" -gt 0 ] && mode="watch"
+    [ ${#runcmd[@]} -gt 0 ] && mode="run"
+
+    # Baselines (start of measurement window).
+    local mem_total; mem_total="$(_meminfo_kb MemTotal)"
+    local swap_total; swap_total="$(_meminfo_kb SwapTotal)"
+    local psi_cpu0 psi_mem0 psi_memf0 psi_io0 psi_iof0
+    psi_cpu0="$(_psi_total cpu some)";  psi_mem0="$(_psi_total memory some)"
+    psi_memf0="$(_psi_total memory full)"; psi_io0="$(_psi_total io some)"; psi_iof0="$(_psi_total io full)"
+    local oom0; oom0="$(_oom_count)"
+    local t_start; t_start=$(date +%s)
+
+    # Running aggregates.
+    local mem_avail_min=999999999 swap_used_max=0 zram_max=0 rss_max=0
+
+    # Take one sample, updating the aggregates above.
+    _probe_take_sample() {
+        local ma su zr rss
+        ma="$(_meminfo_kb MemAvailable)"
+        su=$(( swap_total - $(_meminfo_kb SwapFree) ))
+        zr="$(_zram_memused)"
+        rss="$(_match_rss '(^|[ /])claude([ ]|$)|node .*claude|\.claude')"
+        [ "$ma" -lt "$mem_avail_min" ] && mem_avail_min="$ma"
+        [ "$su" -gt "$swap_used_max" ] && swap_used_max="$su"
+        [ "$zr" -gt "$zram_max" ] && zram_max="$zr"
+        [ "$rss" -gt "$rss_max" ] && rss_max="$rss"
+        return 0   # never let a false [ -gt ] above become the func's exit (set -e)
+    }
+
+    local cmd_exit=""
+    case "$mode" in
+        snapshot)
+            _probe_take_sample
+            ;;
+        watch)
+            log "probe: sampling ${watch}s (every ${interval}s)…"
+            local elapsed=0
+            while [ "$elapsed" -lt "$watch" ]; do
+                _probe_take_sample
+                sleep "$interval"; elapsed=$(( elapsed + interval ))
+            done
+            _probe_take_sample
+            ;;
+        run)
+            log "probe: running [${runcmd[*]}] and measuring until it exits…"
+            "${runcmd[@]}" &
+            local pid=$!
+            while kill -0 "$pid" 2>/dev/null; do
+                _probe_take_sample
+                sleep 1
+                if [ "$watch" -gt 0 ] && [ $(( $(date +%s) - t_start )) -ge "$watch" ]; then break; fi
+            done
+            if wait "$pid" 2>/dev/null; then cmd_exit=0; else cmd_exit=$?; fi
+            _probe_take_sample
+            ;;
+    esac
+
+    local t_end; t_end=$(date +%s)
+    local dur=$(( t_end - t_start ))
+    local mem_avail_now; mem_avail_now="$(_meminfo_kb MemAvailable)"
+    local load1; load1="$(awk '{print $1; exit}' /proc/loadavg 2>/dev/null || echo 0)"
+    local lat; lat="$(_shared_latency_ms)"
+    local oom1; oom1="$(_oom_count)"
+    local uptime_s; uptime_s="$(awk '{print int($1); exit}' /proc/uptime 2>/dev/null || echo 0)"
+    local kern; kern="$(uname -r)"
+    local host; host="$(uname -n)"
+    local ts; ts="$(date -Iseconds)"
+
+    # PSI deltas over the window (microseconds of stall accrued during measure).
+    local d_cpu=$(( $(_psi_total cpu some) - psi_cpu0 ))
+    local d_mem=$(( $(_psi_total memory some) - psi_mem0 ))
+    local d_memf=$(( $(_psi_total memory full) - psi_memf0 ))
+    local d_io=$(( $(_psi_total io some) - psi_io0 ))
+    local d_iof=$(( $(_psi_total io full) - psi_iof0 ))
+    local d_oom=$(( oom1 - oom0 ))
+
+    # Emit one JSON line. Prefer jq for correctness; fall back to printf.
+    local line
+    if have jq; then
+        line="$(jq -nc \
+            --arg ts "$ts" --arg host "$host" --arg kern "$kern" --arg mode "$mode" --arg label "$label" \
+            --argjson uptime "$uptime_s" --argjson dur "$dur" \
+            --argjson mem_total "$mem_total" --argjson mem_avail_min "$mem_avail_min" --argjson mem_avail_now "$mem_avail_now" \
+            --argjson swap_total "$swap_total" --argjson swap_used_max "$swap_used_max" --argjson zram_max "$zram_max" \
+            --argjson rss_max "$rss_max" --argjson load1 "$load1" --argjson lat_ms "$lat" \
+            --argjson psi_cpu_some "$d_cpu" --argjson psi_mem_some "$d_mem" --argjson psi_mem_full "$d_memf" \
+            --argjson psi_io_some "$d_io" --argjson psi_io_full "$d_iof" --argjson oom_delta "$d_oom" \
+            --arg cmd_exit "$cmd_exit" \
+            '{ts:$ts,host:$host,kernel:$kern,mode:$mode,label:$label,uptime_s:$uptime,dur_s:$dur,
+              mem_total_kb:$mem_total,mem_avail_min_kb:$mem_avail_min,mem_avail_now_kb:$mem_avail_now,
+              swap_total_kb:$swap_total,swap_used_max_kb:$swap_used_max,zram_memused_max_b:$zram_max,
+              claude_rss_max_kb:$rss_max,load1:$load1,shared_latency_ms:$lat_ms,
+              psi_us:{cpu_some:$psi_cpu_some,mem_some:$psi_mem_some,mem_full:$psi_mem_full,io_some:$psi_io_some,io_full:$psi_io_full},
+              oom_events_delta:$oom_delta,cmd_exit:($cmd_exit|if .=="" then null else tonumber end)}')"
+    else
+        line="{\"ts\":\"$ts\",\"mode\":\"$mode\",\"label\":\"$label\",\"mem_avail_min_kb\":$mem_avail_min,\"swap_used_max_kb\":$swap_used_max,\"zram_memused_max_b\":$zram_max,\"claude_rss_max_kb\":$rss_max,\"psi_us\":{\"mem_full\":$d_memf,\"io_full\":$d_iof,\"cpu_some\":$d_cpu},\"oom_events_delta\":$d_oom,\"shared_latency_ms\":$lat}"
+    fi
+    printf '%s\n' "$line" >> "$log"
+
+    # Human summary — lead with the degradation-relevant numbers.
+    step "probe ($mode${label:+, $label})"
+    printf '  mem: %s MB free now, low-water %s MB of %s MB total\n' \
+        "$(( mem_avail_now / 1024 ))" "$(( mem_avail_min / 1024 ))" "$(( mem_total / 1024 ))"
+    printf '  zram swap: peak used %s MB of %s MB; mem_used_total peak %s MB\n' \
+        "$(( swap_used_max / 1024 ))" "$(( swap_total / 1024 ))" "$(( zram_max / 1048576 ))"
+    printf '  claude tree peak RSS: %s MB\n' "$(( rss_max / 1024 ))"
+    printf '  PSI stall this window (µs): cpu.some=%s  mem.full=%s  io.full=%s\n' "$d_cpu" "$d_memf" "$d_iof"
+    printf '  shared-mount latency: %s ms   OOM/hung events: %s (Δ %s)\n' "$lat" "$oom1" "$d_oom"
+    [ -n "$cmd_exit" ] && printf '  command exit: %s\n' "$cmd_exit"
+    if [ "$d_memf" -gt 0 ] || [ "$d_oom" -gt 0 ]; then
+        warn "memory stall or OOM observed — this is the signal earlyoom/oom_score_adj would address (see harden-spec)"
+    elif [ "$d_iof" -gt 0 ]; then
+        log "only IO stall observed — degradation here is the shared mount, not memory (tmpfs/ccache territory, not earlyoom)"
+    fi
+    ok "probe appended -> ${log/#$HOME/\~}  ($(wc -l <"$log" 2>/dev/null || echo 0) samples)"
+}
+
+# ---------------------------------------------------------------------------
+# watch — adaptive degradation watcher (the load-time companion to `probe`)
+# ---------------------------------------------------------------------------
+# Bootstrap baselines (probe) only catch a fresh, idle VM — which always looks
+# fine. Real degradation shows up under heavy work (node/python scripts, multi-
+# agent runs). This watcher catches THAT without everyday overhead or log bloat:
+#
+#   calm:  every CALM seconds read just the 3 PSI files + MemAvailable (cheap,
+#          NO ps/dmesg, NO log write). An idle VM logs nothing for hours.
+#   trip:  when mem.full / io.full stall %, low MemAvailable, or a new OOM/hung
+#          event crosses a threshold -> switch to FAST sampling, capture the
+#          culprit process tree (who's eating RSS/CPU: node? python? N claudes?)
+#   close: when calm returns for QUIET consecutive fast-ticks, write ONE
+#          coalesced episode record to metrics/episodes.jsonl and resume calm.
+#
+# So the log grows in proportion to how often the VM actually struggles, and
+# each row tells you the WHY, not just the WHEN. See docs/harden-spec.md.
+# Tunables (env): DEVENV_WATCH_{CALM,FAST,QUIET,MEM_FULL_PCT,IO_FULL_PCT,MEM_FLOOR_MB,MAX_EPISODES}
+
+# Top 5 processes by RSS as a JSON array — the "who caused it" for an episode.
+_top_procs_json() {
+    ps -eo rss=,pcpu=,comm=,args= --sort=-rss 2>/dev/null | head -n 5 | \
+    jq -R -s 'split("\n") | map(select(length>0)) | map(
+        capture("^ *(?<rss>[0-9]+) +(?<cpu>[0-9.]+) +(?<comm>[^ ]+) +(?<args>.*)$") // empty
+        | {comm:.comm, rss_kb:(.rss|tonumber), pcpu:(.cpu|tonumber), args:(.args[0:80])}
+    )' 2>/dev/null || echo '[]'
+}
+
+cmd_watch() {
+    # Long-running daemon loop: disable errexit so a transient read failure or a
+    # false `[ ] && x` test can never kill the watcher (systemd also restarts it).
+    set +e
+    local CALM=${DEVENV_WATCH_CALM:-15} FAST=${DEVENV_WATCH_FAST:-3} QUIET=${DEVENV_WATCH_QUIET:-3}
+    local MEM_PCT=${DEVENV_WATCH_MEM_FULL_PCT:-1.0} IO_PCT=${DEVENV_WATCH_IO_FULL_PCT:-10.0}
+    local MEM_FLOOR=${DEVENV_WATCH_MEM_FLOOR_MB:-300} MAXEP=${DEVENV_WATCH_MAX_EPISODES:-1000}
+    local once=0
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --once)  once=1 ;;
+            --tail)  shift; tail -n "${1:-20}" "$DEVENV_METRICS/episodes.jsonl" 2>/dev/null || warn "no episodes logged yet"; return 0 ;;
+            *)       die "watch: unknown arg: $1 (see: devenv help)" ;;
+        esac
+        shift
+    done
+    have jq || die "watch: jq required (install-base provides it)"
+    mkdir -p "$DEVENV_METRICS"
+    local elog="$DEVENV_METRICS/episodes.jsonl"
+    local nproc_n; nproc_n=$(nproc 2>/dev/null || echo 8)
+
+    log "watch: calm=${CALM}s fast=${FAST}s triggers[mem.full>${MEM_PCT}% io.full>${IO_PCT}% memavail<${MEM_FLOOR}MB oom>0] -> ${elog/#$HOME/\~}"
+
+    local p_memf p_iof oom_prev t_prev
+    p_memf=$(_psi_total memory full); p_iof=$(_psi_total io full)
+    oom_prev=$(_oom_count); t_prev=$(date +%s)
+
+    while :; do
+        sleep "$CALM"
+        local t_now elapsed; t_now=$(date +%s); elapsed=$(( t_now - t_prev )); [ "$elapsed" -lt 1 ] && elapsed=1
+        local c_memf c_iof ma oom_now
+        c_memf=$(_psi_total memory full); c_iof=$(_psi_total io full)
+        ma=$(( $(_meminfo_kb MemAvailable) / 1024 )); oom_now=$(_oom_count)
+        local mem_pct io_pct
+        mem_pct=$(awk -v d="$(( c_memf - p_memf ))" -v e="$elapsed" 'BEGIN{printf "%.3f",(d/(e*1000000))*100}')
+        io_pct=$(awk  -v d="$(( c_iof  - p_iof  ))" -v e="$elapsed" 'BEGIN{printf "%.3f",(d/(e*1000000))*100}')
+
+        local reason=""
+        if   awk -v a="$mem_pct" -v b="$MEM_PCT" 'BEGIN{exit !(a+0>b+0)}'; then reason="mem.full=${mem_pct}%"
+        elif awk -v a="$io_pct"  -v b="$IO_PCT"  'BEGIN{exit !(a+0>b+0)}'; then reason="io.full=${io_pct}%"
+        elif [ "$ma" -lt "$MEM_FLOOR" ]; then reason="mem_avail=${ma}MB"
+        elif [ "$oom_now" -gt "$oom_prev" ]; then reason="oom/hung+$(( oom_now - oom_prev ))"
+        fi
+
+        if [ -n "$reason" ]; then
+            # ---- episode: fast-sample until calm for QUIET consecutive ticks ----
+            local start_ts te0 em0 ei0 ec0 oom_e0
+            start_ts=$(date -Iseconds); te0=$(date +%s)
+            em0=$c_memf; ei0=$c_iof; ec0=$(_psi_total cpu some); oom_e0=$oom_prev
+            local ma_min=$ma swap_max zram_max top_json quiet=0 lm=$c_memf li=$c_iof lt
+            swap_max=$(( $(_meminfo_kb SwapTotal) - $(_meminfo_kb SwapFree) ))
+            zram_max=$(_zram_memused); top_json=$(_top_procs_json); lt=$(date +%s)
+            warn "episode START ($reason)"
+            while [ "$quiet" -lt "$QUIET" ]; do
+                sleep "$FAST"
+                local ft fe nm ni nma su zr mp ip still
+                ft=$(date +%s); fe=$(( ft - lt )); [ "$fe" -lt 1 ] && fe=1
+                nm=$(_psi_total memory full); ni=$(_psi_total io full)
+                nma=$(( $(_meminfo_kb MemAvailable) / 1024 ))
+                [ "$nma" -lt "$ma_min" ] && ma_min=$nma
+                su=$(( $(_meminfo_kb SwapTotal) - $(_meminfo_kb SwapFree) )); zr=$(_zram_memused)
+                [ "$su" -gt "$swap_max" ] && swap_max=$su
+                [ "$zr" -gt "$zram_max" ] && zram_max=$zr
+                top_json=$(_top_procs_json)   # refresh culprit list while hot
+                mp=$(awk -v d="$(( nm - lm ))" -v e="$fe" 'BEGIN{printf "%.3f",(d/(e*1000000))*100}')
+                ip=$(awk -v d="$(( ni - li ))" -v e="$fe" 'BEGIN{printf "%.3f",(d/(e*1000000))*100}')
+                still=0
+                if   awk -v a="$mp" -v b="$MEM_PCT" 'BEGIN{exit !(a+0>b+0)}'; then still=1
+                elif awk -v a="$ip" -v b="$IO_PCT"  'BEGIN{exit !(a+0>b+0)}'; then still=1
+                elif [ "$nma" -lt "$MEM_FLOOR" ]; then still=1
+                fi
+                if [ "$still" = 1 ]; then quiet=0; else quiet=$(( quiet + 1 )); fi
+                lm=$nm; li=$ni; lt=$ft
+            done
+            local end_ts dur fm fio fc oomd
+            end_ts=$(date -Iseconds); dur=$(( $(date +%s) - te0 ))
+            fm=$(( $(_psi_total memory full) - em0 )); fio=$(( $(_psi_total io full) - ei0 ))
+            fc=$(( $(_psi_total cpu some) - ec0 )); oomd=$(( $(_oom_count) - oom_e0 ))
+            local rec
+            rec=$(jq -nc \
+                --arg start "$start_ts" --arg end "$end_ts" --arg reason "$reason" --arg host "$(uname -n)" \
+                --argjson dur "$dur" --argjson mem_full "$fm" --argjson io_full "$fio" --argjson cpu_some "$fc" \
+                --argjson ma_min "$ma_min" --argjson swap_max "$swap_max" --argjson zram_max "$zram_max" \
+                --argjson oom "$oomd" --argjson nproc "$nproc_n" --argjson top "${top_json:-[]}" \
+                '{start:$start,end:$end,dur_s:$dur,trigger:$reason,host:$host,
+                  psi_us:{mem_full:$mem_full,io_full:$io_full,cpu_some:$cpu_some},
+                  mem_avail_min_mb:$ma_min,swap_used_max_kb:$swap_max,zram_memused_max_b:$zram_max,
+                  oom_events:$oom,nproc:$nproc,top_procs:$top}')
+            printf '%s\n' "$rec" >> "$elog"
+            warn "episode END (${dur}s): mem.full=${fm}us io.full=${fio}us memmin=${ma_min}MB"
+            local lc; lc=$(wc -l <"$elog" 2>/dev/null || echo 0)
+            [ "$lc" -gt "$MAXEP" ] && { mv -- "$elog" "$elog.1" 2>/dev/null || true; }
+            p_memf=$(_psi_total memory full); p_iof=$(_psi_total io full)
+            oom_prev=$(_oom_count); t_prev=$(date +%s)
+        else
+            p_memf=$c_memf; p_iof=$c_iof; oom_prev=$oom_now; t_prev=$t_now
+        fi
+        [ "$once" = 1 ] && break
+    done
+    return 0
+}
+
 case "$cmd" in
     help|-h|--help) cmd_help ;;
     init)           cmd_init "$@" ;;
@@ -727,5 +1102,7 @@ case "$cmd" in
     snapshot)       cmd_snapshot ;;
     snapshots)      cmd_snapshots ;;
     restore)        cmd_restore "$@" ;;
+    probe)          cmd_probe "$@" ;;
+    watch)          cmd_watch "$@" ;;
     *) err "unknown command: $cmd"; cmd_help; exit 2 ;;
 esac

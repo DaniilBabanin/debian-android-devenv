@@ -87,11 +87,24 @@ proot-distro login debian -- mkdir -p /mnt/shared
 # termux/bin/dev.
 PD_BIND=(--bind "$ANDROID_STORAGE:/mnt/shared")
 
+# ---- step 2.5: pre-restore snapshot on re-runs ----------------------------------
+# The inner bootstrap restores BEFORE it snapshots. On a re-run over a live
+# guest that order would clobber newer state (rotated Claude creds, fresh
+# ~/.ssh) with an older snapshot — so capture the live state first. First run
+# (no devenv in the guest yet) skips silently.
+step "pre-restore snapshot (re-run protection)"
+if proot-distro login debian "${PD_BIND[@]}" -- bash -lc 'devenv snapshot' >/dev/null 2>&1; then
+    ok "live guest state snapshotted before restore"
+else
+    log "guest has no working devenv yet — first run, nothing to protect"
+fi
+
 # ---- step 3: devenv inside the guest ------------------------------------------
 # Explicit module list (not default mode): skips `watch` (systemd-only).
-# --no-snapshot: the guest CONSUMES VM snapshots (restore seeds Claude creds,
-# ~/.ssh, .config, history) but never produces them — the retained snapshot
-# window stays VM-pure.
+# Termux is the primary runtime now (2026-06): the guest both consumes and
+# PRODUCES snapshots — bootstrap refreshes one at the end, and `dev` keeps the
+# window fresh via a staleness check (DEV_SNAPSHOT_MAX_AGE_DAYS, default 3).
+# The old --no-snapshot "VM-pure window" policy is retired with the VM.
 #
 # Exec-bit hedge: the inner bootstrap calls `devenv` via the ~/.local/bin
 # symlink that init.sh creates, whose target sits on /sdcard (FUSE: no exec
@@ -105,7 +118,7 @@ proot-distro login debian "${PD_BIND[@]}" -- bash -c "
     printf '#!/bin/bash\nexec bash %q/bin/devenv \"\$@\"\n' '$PROOT_REPO' > /opt/devenv-shim/devenv
     chmod +x /opt/devenv-shim/devenv
     export PATH=\"\$PATH:/opt/devenv-shim\"
-    bash '$PROOT_REPO/bootstrap.sh' --no-snapshot base claude cloudflared claude-plugins
+    bash '$PROOT_REPO/bootstrap.sh' base claude cloudflared claude-plugins
 "
 
 # ---- step 4: make `devenv` durable for interactive shells ----------------------
@@ -183,4 +196,5 @@ next steps:
          dev
      (wake-lock + tmux session 'dev' + proot Debian login; detach: Ctrl-b d)
   3. inside, same as the VM: claudea  /  devenv doctor  /  devenv list
+  4. Termux-side health + disaster recovery: dev doctor / dev backup
 EOF

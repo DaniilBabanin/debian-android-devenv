@@ -6,6 +6,16 @@
 # include credentials in state/files/.claude/.credentials.json — never commit).
 state/
 
+# Versioned snapshot store (same content, one dir per version — includes
+# credentials and ssh archives; never commit).
+snapshots/
+
+# Rootfs backups written by `dev backup` (multi-GB tar.gz)
+backups/
+
+# Degradation metrics (probe/episodes JSONL)
+metrics/
+
 # Archives: ~/.ssh, ~/.gnupg, anything else baked as tar.gz
 archives/
 

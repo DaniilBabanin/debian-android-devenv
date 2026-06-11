@@ -1,0 +1,27 @@
+#!/usr/bin/env bash
+# claude-phone-notify — PC-side Claude Code `Notification` hook -> phone.
+#
+# Counterpart of bin/claude-notify-listen: forwards the hook JSON to
+# 127.0.0.1:9876, which the phone's ssh RemoteForward tunnels back to the
+# Termux guest's listener -> claude-notify -> Android notification. Silent
+# no-op when no phone session is up (connect just fails).
+#
+# This runs on the PC, which bootstrap does not manage — installed manually
+# to ~/.local/bin and registered as a Notification hook in ~/.claude/
+# settings.json (see termux/README.md). Kept in the repo so a PC reinstall
+# can redo it.
+#
+# Hook contract: NEVER fail the hook — always exit 0.
+
+json="$(cat)"
+
+# Tag the message with the host so the phone notification says where Claude
+# is waiting. jq missing/garbage -> forward as-is.
+if command -v jq >/dev/null 2>&1; then
+    tagged="$(jq -c --arg h "$(hostname)" \
+        '.message = "[\($h)] " + (.message // "Claude Code needs attention")' \
+        <<<"$json" 2>/dev/null)" && json="$tagged"
+fi
+
+timeout 3 bash -c 'cat > /dev/tcp/127.0.0.1/9876' <<<"$json" 2>/dev/null || true
+exit 0

@@ -4,7 +4,7 @@ set -euo pipefail
 # shellcheck disable=SC1091
 source "$(dirname "${BASH_SOURCE[0]}")/../bin/lib.sh"
 
-PKGS=(python3 python3-pip python3-venv pipx)
+PKGS=(python3 python3-pip python3-venv pipx python3-pytest)
 
 missing=()
 for p in "${PKGS[@]}"; do

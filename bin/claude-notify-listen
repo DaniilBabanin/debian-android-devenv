@@ -1,0 +1,37 @@
+#!/usr/bin/env bash
+# claude-notify-listen — phone-side receiver for PC-side Claude Code hooks.
+#
+# The PC ssh stanzas (install-cloudflared.sh) carry
+#     RemoteForward 127.0.0.1:9876 127.0.0.1:9876
+# so while any ssh session to the PC is up, the PC's Notification hook
+# (bin/claude-phone-notify, installed on the PC at ~/.local/bin) writes its
+# hook JSON to 127.0.0.1:9876 there and it lands here, where claude-notify
+# turns it into a Termux notification.
+#
+# Modes:
+#   claude-notify-listen            foreground (debug)
+#   claude-notify-listen --ensure   background iff not already listening; ssh
+#                                   LocalCommand runs this, so the listener
+#                                   starts lazily with the first PC session
+#                                   and is a no-op on every later one.
+#
+# Silent no-op (exit 0) when socat is missing — VM/PC copies of this devenv
+# have no Termux to notify anyway. No `ss` in the proot guest: liveness is
+# probed by pgrep on the socat command line.
+
+PORT=9876
+NOTIFY=/usr/local/bin/claude-notify
+[ -x "$NOTIFY" ] || NOTIFY="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/claude-notify"
+
+command -v socat >/dev/null 2>&1 || exit 0
+
+if [ "${1:-}" = "--ensure" ]; then
+    # Anchored to the socat argv so shells whose command line merely mentions
+    # the pattern (e.g. an editor or pgrep wrapper) don't count as listening.
+    pgrep -f "^socat TCP-LISTEN:$PORT" >/dev/null 2>&1 && exit 0
+    setsid socat "TCP-LISTEN:$PORT,bind=127.0.0.1,fork,reuseaddr" \
+        EXEC:"bash $NOTIFY" >/dev/null 2>&1 </dev/null &
+    exit 0
+fi
+
+exec socat "TCP-LISTEN:$PORT,bind=127.0.0.1,fork,reuseaddr" EXEC:"bash $NOTIFY"

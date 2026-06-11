@@ -72,6 +72,28 @@ while IFS= read -r spec; do
     fi
 done < <(_read_manifest "$manifest_dir/claude-plugins.txt")
 
+# ---- patch: strip node-dependent caveman hooks when node is absent -------
+# caveman's plugin.json registers SessionStart + UserPromptSubmit hooks that
+# shell out to `node`. With the node module not installed (it's opt-in) those
+# fire on every prompt as `node: not found`. The hooks only maintain a mode
+# flag and power /caveman-stats — caveman's behavior itself comes from the
+# skill + CLAUDE.md, so dropping them is harmless. Reinstalling caveman from
+# the marketplace restores the hooks, hence we re-strip here on every run.
+# Guarded on node-absence: if you later `devenv install node`, the hooks stay
+# and work instead of being stripped. Idempotent (no-op once .hooks is gone).
+if ! have node && have jq; then
+    step "patch caveman hooks (node absent)"
+    while IFS= read -r pj; do
+        jq -e 'has("hooks")' "$pj" >/dev/null 2>&1 || continue
+        tmp="$pj.devenv-patch.$$"
+        if jq 'del(.hooks)' "$pj" > "$tmp" && mv -- "$tmp" "$pj"; then
+            ok "stripped node hooks: $pj"
+        else
+            rm -f -- "$tmp"; warn "failed to patch $pj"
+        fi
+    done < <(find "$HOME/.claude/plugins" -path '*caveman*/.claude-plugin/plugin.json' 2>/dev/null)
+fi
+
 # ---- skills (user-installed via git clone) -------------------------------
 step "skills"
 mkdir -p "$HOME/.claude/skills"

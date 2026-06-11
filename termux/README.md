@@ -39,8 +39,17 @@ dev claude            # single name zooms that pane full-screen
 dev -p 3              # grow to N panes (grow-only, never kills)
 dev -s other claude   # force the session name (override the derived one)
 dev -c devenv doctor  # one-off in the guest, no tmux (aliases work: dev -c claudea)
+dev doctor            # Termux-side health check (see below)
+dev backup            # rootfs backup to <repo>/backups/ (see below)
 dev -l / dev -h       # list sessions / usage
 ```
+
+`dev` maintains itself: every run reinstalls `$PREFIX/bin/dev` if the repo
+copy changed (then re-execs — editing `termux/bin/dev` is enough, no manual
+reinstall), and kicks off a background `devenv snapshot` when the newest one
+is older than `DEV_SNAPSHOT_MAX_AGE_DAYS` (default 3, `0` disables; Termux
+notification on completion, log at `~/.local/state/devenv/snapshot.log`).
+`doctor` and `backup` are reserved words, not usable as pane names.
 
 Inside it's `claudea`, `devenv doctor`, `devenv install <mod>` — same as the VM.
 Layout follows pane count: 2 = side-by-side halves, 3 = first pane full left +
@@ -54,16 +63,32 @@ full-screen apps (Claude Code, less, vim) get raw `PgUp`. A finger-drag selects
 within the active pane; Termux long-press selection ignores panes (spans the
 screen) — zoom the pane first if you need it.
 
-## Persistence (differs from the VM)
+## Persistence (Termux is primary now)
 
 The rootfs + its `$HOME` live in Termux app data: they survive reboots and app
-updates, dying only on uninstall / data-clear. **No frequent rebuilds** — the
-guest *reads* VM snapshots (creds/ssh/config seeding) but never *writes* them
-(`--no-snapshot` is hard-coded), so the VM's retained-3 window stays pure.
-Disaster recovery = re-run `termux/bootstrap.sh`, restore re-seeds.
+updates, dying only on uninstall / data-clear. Since 2026-06 the guest both
+*reads and writes* the devenv snapshots (the old "VM-pure window" policy is
+retired with the VM):
 
-Caveat: VM and Termux share one OAuth refresh token — running both regularly may
-force a re-login in one. This is a migration, not a dual daily-driver.
+- **dotfiles/creds layer** — `devenv snapshot` in the guest, kept fresh
+  automatically by `dev`'s staleness check (default: refresh when >3 days
+  old). This is what makes a re-bootstrap come back logged in. Re-running
+  `termux/bootstrap.sh` over a live guest snapshots *first*, so a stale
+  snapshot can't clobber newer creds.
+- **whole-rootfs layer** — `dev backup` writes a `proot-distro backup` tar.gz
+  to `<repo>/backups/` (keeps `DEV_BACKUP_RETAIN`, default 2). Run it with no
+  guest sessions open (it refuses otherwise; `--force` overrides) and the
+  phone plugged in — it's several GB. Recovery on a fresh Termux:
+  `pkg install proot-distro && proot-distro restore <file>`. Without a rootfs
+  backup, recovery = re-run `termux/bootstrap.sh` (~20 min) + snapshot
+  restore.
+
+Why no cron for any of this: on Samsung, crond/JobScheduler scheduling is
+best-effort at most (doze + OEM killers); the run-on-use staleness check is
+the only pattern immune to both. `dev doctor` reports the age of both layers.
+
+Caveat: VM and Termux share one OAuth refresh token — running both regularly
+may force a re-login in one. This is a migration, not a dual daily-driver.
 
 ## Phone notifications from PC-side Claude
 
@@ -83,8 +108,17 @@ Notification hook in the PC's `~/.claude/settings.json`.
 
 ## Limits / debugging
 
-- `watch` module (systemd) is skipped — no systemd under proot; `devenv probe` degrades gracefully.
+- `watch` module (systemd) is skipped — no systemd under proot, and it
+  couldn't work anyway: `/proc/pressure/*` is permission-denied and `dmesg`
+  unavailable in the guest (verified on-device 2026-06-11), so the PSI/OOM
+  signals it samples don't exist here. Phantom-kill detection = `dev doctor`
+  reminder + `mitigate.sh --verify` after any signal-9.
 - File-heavy ops (apt, npm install, big greps) pay proot's ptrace tax — slower than the VM, in exchange for not crashing.
+- **Keep working trees in the guest `$HOME`, not `/mnt/shared`**: the shared
+  mount adds FUSE on top of the ptrace tax — measured ~3× slower on
+  small-file workloads (200-file create+read+delete: 1.6 s in `$HOME` vs
+  4.8 s on `/mnt/shared`). The shared mount is for the persistence layer and
+  things Android apps must see, not for git checkouts or `node_modules`.
 - Random `[Process completed (signal 9)]` → mitigation regressed (an Android update can reset the flag); re-run `mitigate.sh --verify` and recheck the Samsung list.
 - `devenv` in the guest is an exec-wrapper (`/sdcard` has no exec bit, so the symlink `init.sh` creates can't run). A bare `devenv init` re-creates that broken symlink — re-run `termux/bootstrap.sh` to re-fix if `devenv` stops resolving.
 
