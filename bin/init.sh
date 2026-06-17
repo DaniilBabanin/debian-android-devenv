@@ -57,12 +57,22 @@ for snap_rel in "${SNAPSHOT_FILES[@]}"; do
     _unlink_legacy "${snap_rel%%/*}"
 done
 
-# Put `devenv` on PATH via ~/.local/bin
+# Put devenv bin commands (BIN_COMMANDS from lib.sh) on PATH via ~/.local/bin.
+# The shared mount is no-exec (sdcardfs/bind): a symlink into it cannot be
+# executed, so we write a tiny exec shim on the local fs that runs the mount
+# copy through bash. %q-quote the path so spaces/odd chars survive.
 mkdir -p "$HOME/.local/bin"
-if [ ! -L "$HOME/.local/bin/devenv" ] || [ "$(readlink "$HOME/.local/bin/devenv")" != "$DEVENV_BIN/devenv" ]; then
-    ln -sf "$DEVENV_BIN/devenv" "$HOME/.local/bin/devenv"
-    ok "linked ~/.local/bin/devenv -> $DEVENV_BIN/devenv"
-fi
+for cmd in "${BIN_COMMANDS[@]}"; do
+    src="$DEVENV_BIN/$cmd"
+    dst="$HOME/.local/bin/$cmd"
+    [ -e "$src" ] || { warn "skip $cmd — not found in $DEVENV_BIN"; continue; }
+    want="$(printf '#!/bin/bash\nexec bash %q "$@"\n' "$src")"
+    if [ "$(cat "$dst" 2>/dev/null)" != "$want" ]; then
+        printf '%s\n' "$want" > "$dst"
+        chmod +x "$dst"
+        ok "shimmed ~/.local/bin/$cmd -> bash $src"
+    fi
+done
 
 # Retire the shutdown snapshot unit. Snapshots are now taken on successful boot
 # (bootstrap step 4), so the old ExecStop-on-shutdown unit is removed: it

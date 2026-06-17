@@ -1,0 +1,62 @@
+#!/usr/bin/env bash
+# sshbab — reconnecting SSH to the `pc` host (Cloudflare tunnel), auto-attaching
+# to a *named* remote tmux session. Run one per terminal tab/window so each tab
+# owns its own session and always reattaches to the same one after a drop.
+#
+#   sshbab work          attach (or create) remote tmux session "work"
+#   sshbab logs          a second tab → its own session "logs"
+#   sshbab               session name taken from $SSHBAB_SESSION
+#
+# Behaviour:
+#   * connection drop (network / tunnel death) → reconnect after $SSHBAB_RETRY s
+#   * clean detach (Ctrl-b d) or `exit` on the remote → quits the loop
+#   * Ctrl-C while connected → quits the loop
+#
+# Env overrides:
+#   SSHBAB_HOST     ssh host to use                  (default: ssh.babanin.de)
+#   SSHBAB_SESSION  session name when none passed    (default: unset)
+#   SSHBAB_RETRY    seconds between reconnect tries   (default: 3)
+#   SSHBAB_ALIVE_INTERVAL  ssh ServerAliveInterval    (default: 15)
+#   SSHBAB_ALIVE_COUNT     ssh ServerAliveCountMax    (default: 3)
+#   SSHBAB_ATTACH_ONLY=1  never auto-create; fail if session is gone
+#
+# Host config (ProxyCommand cloudflared, User) is the `Host ssh.babanin.de`
+# stanza the cloudflared module writes to ~/.ssh/config. That stanza sets no
+# ServerAlive*, so we pass our own via -o below: without it a dropped tunnel
+# hangs the session forever and the reconnect loop never fires. ~45s to detect
+# a dead link (interval 15 x count 3).
+set -u
+
+host="${SSHBAB_HOST:-ssh.babanin.de}"
+delay="${SSHBAB_RETRY:-3}"
+session="${1:-${SSHBAB_SESSION:-}}"
+ssh_opts=(
+    -t
+    -o ServerAliveInterval="${SSHBAB_ALIVE_INTERVAL:-15}"
+    -o ServerAliveCountMax="${SSHBAB_ALIVE_COUNT:-3}"
+)
+
+if [ -z "$session" ]; then
+    echo "usage: sshbab <session>   (or export SSHBAB_SESSION)" >&2
+    exit 2
+fi
+
+# Build the remote command. printf %q quotes the session name safely for the
+# remote shell (handles spaces / odd chars).
+q_session="$(printf '%q' "$session")"
+if [ "${SSHBAB_ATTACH_ONLY:-0}" = 1 ]; then
+    remote_cmd="tmux attach -t $q_session"
+else
+    remote_cmd="tmux attach -t $q_session || tmux new -s $q_session"
+fi
+
+while true; do
+    ssh "${ssh_opts[@]}" "$host" "$remote_cmd"
+    code=$?
+    case "$code" in
+        0)   echo "[sshbab:$session] clean exit"; break ;;
+        130) echo "[sshbab:$session] interrupted"; break ;;
+        *)   echo "[sshbab:$session] dropped (ssh exit $code) — reconnecting in ${delay}s (Ctrl-C to quit)…" >&2
+             sleep "$delay" || break ;;
+    esac
+done

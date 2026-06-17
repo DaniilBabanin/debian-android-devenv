@@ -37,6 +37,10 @@ dev — proot guest workspace: named, auto-tiled panes in one tmux view
                         unzoom and see them)
   dev -s SESSION ...    force a specific session name (overrides the
                         name-derived one); bare 'dev' uses session 'dev'
+
+  (for PC-side sessions use the sibling command `devpc NAME...`: same tiling,
+   but each pane is an auto-reconnecting ssh to the PC attaching that PC-side
+   tmux session — `devpc -h` for details.)
   dev -p N              grow the view to N panes (overrides DEV_PANES;
                         grow-only, never kills panes)
   dev -c CMD [ARGS...]  one-off command inside the guest, no tmux: login
@@ -76,6 +80,21 @@ valid_name() {
     case "$1" in *[!A-Za-z0-9_-]*|'') return 1 ;; *) return 0 ;; esac
 }
 
+# Command tmux runs for a pane named $1, per $mode (set during arg parsing):
+#   guest (default) — a plain proot guest login (same as default-command).
+#   pc              — log into the guest and run `sshbab $1`: a reconnecting
+#                     ssh to the PC (Host ssh.babanin.de) that attaches, or
+#                     creates, the PC-side tmux session $1, re-dialing if the
+#                     tunnel drops.
+# Names are pre-validated to [A-Za-z0-9_-], so they need no further quoting.
+pane_command() {
+    if [ "${mode:-guest}" = pc ]; then
+        printf '%s -- bash -lc %s' "${login[*]}" "'sshbab $1'"
+    else
+        printf '%s' "${login[*]}"
+    fi
+}
+
 # ---- self-maintenance ---------------------------------------------------------
 # Termux is the primary runtime now: the guest both consumes AND produces the
 # devenv snapshots, and `dev` keeps itself and the snapshot window fresh so
@@ -94,6 +113,13 @@ c_log()  { printf '\033[34m[dev ]\033[0m %s\n' "$*"; }
 # needed" footgun — editing termux/bin/dev in the repo is enough.
 self_update() {
     local src="$REPO/termux/bin/dev" inst="$PREFIX/bin/dev"
+    # Keep the devpc sibling wrapper in sync too, so a plain `dev` run makes
+    # `devpc` available (and current) without re-running termux/bootstrap.sh.
+    local psrc="$REPO/termux/bin/devpc" pinst="$PREFIX/bin/devpc"
+    if [ -f "$psrc" ] && ! cmp -s "$psrc" "$pinst" 2>/dev/null; then
+        install -m 0755 "$psrc" "$pinst" 2>/dev/null && c_log "installed/updated devpc" \
+            || c_warn "devpc install failed (left as-is)"
+    fi
     [ -f "$src" ] || return 0
     cmp -s "$src" "$inst" 2>/dev/null && return 0
     install -m 0755 "$src" "$inst" || { c_warn "dev: self-update failed (left as-is)"; return 0; }
@@ -286,6 +312,11 @@ cmd_doctor() {
 # Keep the installed copy in sync with the repo before anything else.
 self_update "$@"
 
+# Local (guest) panes by default; the `devpc` wrapper sets DEV_MODE=pc to make
+# every pane an auto-reconnecting ssh to the PC instead. Keeping this on an env
+# flag (not a `dev pc` positional) means `dev` never special-cases a pane name.
+mode="${DEV_MODE:-guest}"
+
 # Subcommands (reserved words — not usable as pane names).
 case "${1:-}" in
     doctor) cmd_doctor; exit ;;
@@ -338,6 +369,16 @@ done
 # value is a valid tmux session name.
 if [ "$session_explicit" = 0 ] && [ ${#names[@]} -gt 0 ]; then
     session="$(IFS=-; printf '%s' "${names[*]}")"
+    # Namespace PC views so `devpc x y` (pc-x-y) never collides with a local
+    # `dev x y` (x-y) view that addresses the same names.
+    [ "$mode" = pc ] && session="pc-$session"
+fi
+
+# pc mode addresses PC-side sessions by name — there's nothing to do without
+# at least one.
+if [ "$mode" = pc ] && [ ${#names[@]} -eq 0 ]; then
+    echo "devpc: needs at least one PC tmux session name (e.g. devpc work logs)" >&2
+    exit 2
 fi
 
 wake
@@ -351,7 +392,13 @@ maybe_snapshot
 # by older versions pick up the behavior.
 session_created=0
 if ! tmux has-session -t "$session" 2>/dev/null; then
-    tmux new-session -d -s "$session" "${login[*]}"
+    # In pc mode the first pane must run sshbab for the first name, not a bare
+    # guest login (the named-pane loop below only titles it, never re-splits).
+    if [ "$mode" = pc ] && [ ${#names[@]} -gt 0 ]; then
+        tmux new-session -d -s "$session" "$(pane_command "${names[0]}")"
+    else
+        tmux new-session -d -s "$session" "${login[*]}"
+    fi
     session_created=1
 fi
 # New windows and splits log into the guest instead of a Termux shell...
@@ -398,7 +445,11 @@ if [ ${#names[@]} -gt 0 ]; then
     fi
     for n in "${names[@]}"; do
         if ! tmux list-panes -t "$session" -F '#{pane_title}' | grep -qxF "$n"; then
-            id="$(tmux split-window -d -P -F '#{pane_id}' -t "$(last_pane)")"
+            if [ "$mode" = pc ]; then
+                id="$(tmux split-window -d -P -F '#{pane_id}' -t "$(last_pane)" "$(pane_command "$n")")"
+            else
+                id="$(tmux split-window -d -P -F '#{pane_id}' -t "$(last_pane)")"
+            fi
             tmux select-pane -t "$id" -T "$n"
         fi
     done

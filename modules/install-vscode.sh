@@ -175,6 +175,7 @@ Host pc-fwd
     ExitOnForwardFailure yes
     LocalForward 8001 localhost:8000
     LocalForward 8080 localhost:8080
+    LocalForward 8137 localhost:8137
 EOF
     ok "vscode-ssh: appended Host pc-fwd stanza"
 fi

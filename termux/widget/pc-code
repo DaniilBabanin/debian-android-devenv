@@ -1,0 +1,30 @@
+#!/data/data/com.termux/files/usr/bin/bash
+# Termux:Widget shortcut — open the PC's VS Code (code-server bound to the PC's
+# localhost:8080) in Chrome.
+#
+# The PC's :8080 is NOT public: it's bound to localhost on ssh.babanin.de and
+# reached only through the cloudflared ssh tunnel. The `pc-fwd` ssh stanza
+# already carries `LocalForward 8080 localhost:8080`, brought up by the
+# `pc-tunnel` autossh session (it also forwards 8001/8137). So we ensure that
+# one shared forward is alive, then point Chrome at the phone's localhost:8080.
+#
+# Reuses the `pc-tunnel` tmux session on purpose: a second autossh would try to
+# bind the same LocalForward ports and die (ExitOnForwardFailure).
+termux-wake-lock 2>/dev/null
+if tmux has-session -t pc-tunnel 2>/dev/null; then
+    echo "pc-tunnel already up -> PC :8080 forwarded to localhost:8080"
+else
+    tmux new-session -d -s pc-tunnel \
+        "proot-distro login debian --bind /storage/emulated/0:/mnt/shared -- bash -lic pc-tunnel"
+    echo "pc-tunnel started -> forwarding PC :8080 (cloudflared + ssh need a few s)"
+    sleep 5   # cloudflared + ssh handshake; refresh Chrome if it loads early
+fi
+
+# Force Chrome specifically (the other widgets use the default browser via
+# termux-open-url; here the request is Chrome). Fall back to the default
+# browser if Chrome isn't installed / the activity name ever changes.
+url="http://localhost:8080"
+am start -a android.intent.action.VIEW -d "$url" \
+    -n com.android.chrome/com.google.android.apps.chrome.Main >/dev/null 2>&1 \
+    || termux-open-url "$url" 2>/dev/null \
+    || true

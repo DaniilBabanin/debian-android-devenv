@@ -50,6 +50,14 @@ LINK_DOTFILES=(
     .npmrc
 )
 
+# Scripts under $DEVENV_BIN exposed as user commands on PATH (symlinked into
+# ~/.local/bin by init.sh). Add a bin/ script's basename here to make it a
+# first-class command after bootstrap.
+BIN_COMMANDS=(
+    devenv
+    sshbab
+)
+
 # What gets snapshot/restored instead of symlinked. Anything that does SQLite,
 # WAL, flock(), or write-tmp-then-rename MUST go here, not in LINK_DOTFILES.
 # .bash_history is a file rather than a directory; snapshot/restore handle both.

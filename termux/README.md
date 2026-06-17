@@ -38,11 +38,29 @@ dev claude builds     # a tiled guest pane per name — and the name-set IS the
 dev claude            # single name zooms that pane full-screen
 dev -p 3              # grow to N panes (grow-only, never kills)
 dev -s other claude   # force the session name (override the derived one)
+devpc work logs       # PC-side: a pane per remote tmux session, each an
+                      #   auto-reconnecting `ssh pc` (view 'pc-work-logs')
 dev -c devenv doctor  # one-off in the guest, no tmux (aliases work: dev -c claudea)
 dev doctor            # Termux-side health check (see below)
 dev backup            # rootfs backup to <repo>/backups/ (see below)
 dev -l / dev -h       # list sessions / usage
 ```
+
+`devpc NAME...` is the on-PC counterpart of `dev NAME...`: instead of local
+guest panes it opens a pane per remote tmux session, each running `sshbab` in
+the guest — a loop that `ssh ssh.babanin.de`s and `tmux attach`es (or creates)
+session NAME, redialing whenever the Cloudflare tunnel drops and always landing
+back in the same session. Sessions are namespaced `pc-NAME-...` so they never
+collide with a local `dev NAME...` view. The host config (cloudflared
+ProxyCommand, User) is the `Host ssh.babanin.de` stanza the cloudflared module
+writes to the guest `~/.ssh/config`; `sshbab` adds its own `ServerAlive*` via
+`-o` (the stanza sets none, so a dead tunnel would otherwise hang forever and
+the reconnect loop never fire). A clean detach (`Ctrl-b d` on the PC tmux) or
+remote exit closes the pane; a dropped link reconnects. `devpc` is a thin
+wrapper over `dev` (`DEV_MODE=pc`); `dev` keeps it installed/updated via
+self-update. `sshbab` is a standalone guest command too (`sshbab work`) — see
+`bin/sshbab`. One-tap launcher: the `devpc-claude-edit` widget opens the
+split-screen `claude` + `edit` PC view (`widget/devpc-claude-edit`).
 
 `dev` maintains itself: every run reinstalls `$PREFIX/bin/dev` if the repo
 copy changed (then re-execs — editing `termux/bin/dev` is enough, no manual
@@ -120,7 +138,12 @@ Notification hook in the PC's `~/.claude/settings.json`.
   4.8 s on `/mnt/shared`). The shared mount is for the persistence layer and
   things Android apps must see, not for git checkouts or `node_modules`.
 - Random `[Process completed (signal 9)]` → mitigation regressed (an Android update can reset the flag); re-run `mitigate.sh --verify` and recheck the Samsung list.
-- `devenv` in the guest is an exec-wrapper (`/sdcard` has no exec bit, so the symlink `init.sh` creates can't run). A bare `devenv init` re-creates that broken symlink — re-run `termux/bootstrap.sh` to re-fix if `devenv` stops resolving.
+- Guest commands from the repo `bin/` (`devenv`, `sshbab`, …) are exposed as
+  exec-shims in `~/.local/bin` (`/sdcard` has no exec bit, so a symlink into the
+  mount can't run). `init.sh` writes these shims for every name in `lib.sh`'s
+  `BIN_COMMANDS`, so a bare `devenv init` now refreshes them instead of leaving
+  a dead symlink. To add a new guest command: drop it in `bin/`, add its
+  basename to `BIN_COMMANDS`, re-run `devenv init` (or `termux/bootstrap.sh`).
 
 ## Validation (after first setup)
 

@@ -1,0 +1,17 @@
+#!/data/data/com.termux/files/usr/bin/bash
+# devpc — PC-side counterpart of `dev`. Same tiled tmux workspace, but each
+# named pane is an auto-reconnecting ssh to the PC (Host ssh.babanin.de in the
+# guest's ~/.ssh/config: Cloudflare tunnel ProxyCommand) that attaches — or
+# creates — the PC-side tmux session of that name, redialing whenever the
+# tunnel drops.
+#
+#   devpc work logs     tiled view 'pc-work-logs', a pane per PC tmux session
+#   devpc claude        single pane, zoomed, PC session 'claude'
+#   devpc -h            full help (shared with dev)
+#
+# Thin wrapper over `dev`: DEV_MODE=pc switches dev's per-pane command from a
+# local guest login to `sshbab NAME` in the guest. Keeping it a separate
+# command (rather than `dev pc ...`) means `dev` never treats a word as a mode
+# selector — no chance of a session name being eaten. `dev` keeps this file in
+# sync via its self-update, so editing it in the repo is enough.
+exec env DEV_MODE=pc dev "$@"

@@ -166,6 +166,10 @@ fi
 step "install dev wrapper"
 install -m 0755 "$TERMUX_REPO/termux/bin/dev" "$PREFIX/bin/dev"
 ok "installed $PREFIX/bin/dev"
+# devpc: PC-side sibling (runs `dev` with DEV_MODE=pc). `dev` self-installs it
+# too, but seed it here so it's present before the first `dev` run.
+install -m 0755 "$TERMUX_REPO/termux/bin/devpc" "$PREFIX/bin/devpc"
+ok "installed $PREFIX/bin/devpc"
 
 # ---- step 7: Termux:Widget shortcuts --------------------------------------------
 # One-tap launchers. Needs the Termux:Widget app (same source as Termux —
