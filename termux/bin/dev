@@ -453,6 +453,24 @@ if [ ${#names[@]} -gt 0 ]; then
             tmux select-pane -t "$id" -T "$n"
         fi
     done
+
+    # ---- prune foreign panes --------------------------------------------------
+    # A multi-name view (`dev x y` / `devpc x y`) must show EXACTLY x y. Any pane
+    # whose title isn't one of the requested names is stray — a leftover from an
+    # earlier/interrupted run, or a manual Ctrl-b % split that picked up a
+    # clobbered title — and would otherwise linger forever (the named loop above
+    # only adds, never removes) and push the layout into an extra tile. Drop it.
+    # Scoped to THIS session, so panes in other Termux tabs (each tab attaches
+    # its own name-derived session) are never touched — different name-set,
+    # different session, not listed here. The named loop guarantees a pane per
+    # name still exists, so this never empties the session. Single-name views are
+    # exempt: they keep their zoom-one-pane-leave-the-rest-alive behavior below.
+    if [ ${#names[@]} -ge 2 ]; then
+        while read -r _pid _ptitle; do
+            for n in "${names[@]}"; do [ "$_ptitle" = "$n" ] && continue 2; done
+            tmux kill-pane -t "$_pid" 2>/dev/null || true
+        done < <(tmux list-panes -t "$session" -F '#{pane_id} #{pane_title}')
+    fi
 fi
 
 # ---- pane count -------------------------------------------------------------------
