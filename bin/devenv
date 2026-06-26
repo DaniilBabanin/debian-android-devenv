@@ -332,6 +332,34 @@ _ensure_rsync() {
     have rsync || die "rsync is required for snapshot/restore — install with: sudo apt install rsync"
 }
 
+# rsync flags shared by every snapshot copy. The destination is the FUSE/
+# sdcardfs shared mount, which can't store POSIX metadata:
+#   --no-links                it can't create symlinks (virtio-fs)
+#   --no-perms/-owner/-group  it forces its own mode+ownership, so asking rsync
+#   --no-times                to preserve metadata only yields "failed to set
+#                             permissions" errors and a code-23 exit. Mode-
+#                             sensitive dirs (~/.ssh) go through tar (ARCHIVE_DIRS)
+#                             instead. Each snapshot is a full copy into a fresh
+#                             *.partial, so dropped mtimes cost nothing (there is
+#                             no incremental reuse to preserve).
+DEVENV_SNAPSHOT_RSYNC=(-a --no-links --no-perms --no-owner --no-group --no-times --info=progress2)
+
+# Run an rsync into the snapshot tree, tolerating the partial-transfer exits
+# (23/24). On this mount a single file whose name it can't represent (e.g. a
+# stray `config.yaml:` — colon is forbidden) makes rsync exit 23; under
+# `set -euo pipefail` that aborted the whole snapshot, leaving an unpromoted
+# *.partial. That failure was silent and cost 20 days of dead snapshots behind
+# one junk file. Now: warn, skip that file, keep the rest of the snapshot.
+_snapshot_rsync() {
+    local rc=0
+    rsync "$@" || rc=$?
+    case "$rc" in
+        0) ;;
+        23|24) warn "snapshot: rsync partial transfer (exit $rc) — a file the shared mount can't store was skipped; rest captured" ;;
+        *)     die "snapshot: rsync failed (exit $rc)" ;;
+    esac
+}
+
 # Copy a single entry from $HOME into the snapshot tree.
 _snapshot_entry() {
     local name="$1"
@@ -354,7 +382,7 @@ _snapshot_entry() {
         # dirs) is excluded as a whole because it would be empty after
         # --no-links anyway; systemctl --user enable in init.sh recreates it
         # on restore.
-        rsync -a --no-links --delete --info=progress2 \
+        _snapshot_rsync "${DEVENV_SNAPSHOT_RSYNC[@]}" --delete \
             --exclude='*.db-wal' --exclude='*.db-shm' --exclude='*.lock' \
             --exclude='*.wants/' \
             --exclude='systemd/user/devenv-snapshot.service' \
@@ -366,7 +394,7 @@ _snapshot_entry() {
     else
         # Regular file (e.g. .bash_history).
         mkdir -p "$(dirname "$dst")"
-        rsync -a --no-links --info=progress2 -- "$src" "$dst"
+        _snapshot_rsync "${DEVENV_SNAPSHOT_RSYNC[@]}" -- "$src" "$dst"
         ok "snapshot: ~/$name"
     fi
 }
@@ -468,7 +496,7 @@ _snapshot_file() {
     fi
 
     mkdir -p "$(dirname "$dst")"
-    rsync -a --no-links --info=progress2 -- "$src" "$dst"
+    _snapshot_rsync "${DEVENV_SNAPSHOT_RSYNC[@]}" -- "$src" "$dst"
     ok "snapshot-file: ~/$rel"
 }
 
