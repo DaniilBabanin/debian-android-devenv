@@ -309,6 +309,17 @@ cmd_doctor() {
     if [ "$fails" -eq 0 ]; then c_ok "doctor: all clear"; else c_warn "doctor: $fails issue(s)"; return 1; fi
 }
 
+# `dev` is the Termux-side entry command; it relies on $PREFIX (Termux's bin
+# dir) for self-update and the doctor check. Termux's bin is on PATH inside the
+# proot guest too, so `dev` resolves there — but $PREFIX isn't exported into the
+# guest, and `set -eu` would otherwise abort with a cryptic "PREFIX: unbound
+# variable". Bail early with a clear pointer instead.
+if [ -z "${PREFIX:-}" ]; then
+    c_warn "dev: run this from Termux, not inside the proot guest."
+    c_warn "  inside the guest use the guest tools directly, e.g.: devenv snapshot"
+    exit 2
+fi
+
 # Keep the installed copy in sync with the repo before anything else.
 self_update "$@"
 

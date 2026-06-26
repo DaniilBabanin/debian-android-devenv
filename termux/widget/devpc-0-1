@@ -1,0 +1,9 @@
+#!/data/data/com.termux/files/usr/bin/bash
+# Termux:Widget shortcut — PC-side split-screen workspace: two side-by-side
+# panes, each an auto-reconnecting ssh to the PC (ssh.babanin.de, Cloudflare
+# tunnel) attaching its own PC tmux session:
+#   0   left pane  — PC tmux session '0'
+#   1   right pane — PC tmux session '1'
+# Re-tapping reattaches the same 'pc-0-1' view; a dropped tunnel
+# redials into the same sessions. (devpc -> dev handles the wake-lock.)
+exec devpc 0 1
